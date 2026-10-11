@@ -1,0 +1,6 @@
+# Tracker / analytics domains
+google-analytics.com
+scorecardresearch.com
+hotjar.com
+mixpanel.com
+segment.io

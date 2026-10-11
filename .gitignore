@@ -1,0 +1,38 @@
+# Java / Maven
+backend/target/
+*.class
+# Node
+frontend/node_modules/
+frontend/dist/
+# Runtime
+logs/*.log
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Secrets / local overrides (never commit)
+.env
+.env.*
+!.env.example
+*.local.properties
+*.pem
+*.key
+*.ppk
+id_rsa*
+
+# Runtime data
+logs/*
+!logs/.gitkeep
+*.db
+stats-*.json
+blocklists/downloaded/
+
+# Build / tooling
+*.jar
+*.log
+npm-debug.log*
+frontend/.vite/
+coverage/

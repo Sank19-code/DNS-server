@@ -1,0 +1,10 @@
+# Ad domains - one per line (plain or hosts format). Parent match: listing a domain blocks its subdomains.
+# Day 2: optionally append a real list, e.g. StevenBlack/hosts (unified hosts file)
+doubleclick.net
+googlesyndication.com
+googleadservices.com
+adservice.google.com
+ads.yahoo.com
+adnxs.com
+taboola.com
+outbrain.com
