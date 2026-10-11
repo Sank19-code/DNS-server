@@ -43,7 +43,7 @@ public class ApiServer {
     }
 
     public void start() throws IOException {
-        int port = config.getInt("api.port", 8080);
+        int port = config.getInt("api.port", 8081);
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.setExecutor(Executors.newFixedThreadPool(4));
 

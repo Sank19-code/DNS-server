@@ -20,7 +20,7 @@ export default function App() {
         setQueries(q)
         setError(null)
       } catch (e) {
-        setError('Backend not reachable - is the Java server running on :8080?')
+        setError('Backend not reachable - is the Java server running on :8081?')
       }
     }
     load()

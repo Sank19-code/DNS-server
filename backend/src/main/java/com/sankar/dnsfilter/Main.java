@@ -32,7 +32,7 @@ public class Main {
 
         DnsServer dns = new DnsServer(config, blocklist, cache, upstream, stats);
         System.out.println("DNS filter starting... DNS port " + config.getInt("dns.port", 5300)
-                + ", API port " + config.getInt("api.port", 8080));
+                + ", API port " + config.getInt("api.port", 8081));
         dns.start(); // blocks forever
     }
 }

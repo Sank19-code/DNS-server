@@ -18,6 +18,8 @@ import java.util.concurrent.Executors;
  * upstream lookup never blocks other clients.
  */
 public class DnsServer {
+    /** Run with -Ddns.debug=true to log every packet in/out. */
+    private static final boolean DEBUG = Boolean.getBoolean("dns.debug");
     private static final int MAX_UDP = 512; // classic DNS-over-UDP limit (EDNS can go bigger)
 
     private final Config config;
@@ -40,14 +42,17 @@ public class DnsServer {
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
                 socket.receive(packet);
                 byte[] data = Arrays.copyOf(packet.getData(), packet.getLength());
+                if (DEBUG) System.out.println("RECV " + data.length + " bytes from " + packet.getSocketAddress());
                 workers.submit(() -> {
                     try {
                         byte[] reply = handler.handle(data, packet.getAddress().getHostAddress());
                         if (reply != null) {
                             socket.send(new DatagramPacket(reply, reply.length, packet.getSocketAddress()));
+                            if (DEBUG) System.out.println("SENT " + reply.length + " bytes to " + packet.getSocketAddress());
                         }
                     } catch (Exception e) {
-                        System.err.println("Error handling query: " + e.getMessage());
+                        System.err.println("Error handling query: " + e);
+                        e.printStackTrace();
                     }
                 });
             }

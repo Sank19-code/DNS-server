@@ -14,7 +14,7 @@
                                           ▼
                                      reply to client
 
- React dashboard (:5173) ──HTTP /api──► ApiServer (JDK HttpServer :8080) ──► StatsCollector / Blocklist / DnsCache
+ React dashboard (:5173) ──HTTP /api──► ApiServer (JDK HttpServer :8081) ──► StatsCollector / Blocklist / DnsCache
 ```
 
 ## Packages (`backend/src/main/java/com/sankar/dnsfilter/`)

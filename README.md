@@ -23,7 +23,7 @@ logs/         query log output
 
 ## Run
 ```bat
-scripts\run-backend.bat      :: DNS on UDP 5300, API on http://localhost:8080/api
+scripts\run-backend.bat      :: DNS on UDP 5300, API on http://localhost:8081/api
 scripts\run-frontend.bat     :: dashboard on http://localhost:5173
 nslookup -port=5300 google.com 127.0.0.1
 ```
