@@ -10,7 +10,8 @@ import java.nio.charset.StandardCharsets;
  *  - buildNullRouteResponse(query): answer A -> 0.0.0.0 / AAAA -> :: (Pi-hole style)
  *  - buildErrorResponse(query, rcode): SERVFAIL / FORMERR replies
  *  - rewriteId(cachedBytes, newId): cached responses must carry the NEW query's ID
- *  - TODO (bonus): adjustTtl(cachedBytes, remainingSeconds) to decrement cached TTLs
+ *  - adjustTtl(cachedBytes, ageSeconds): decrement every TTL in a cached reply by its age
+ *  - prepareCachedReply(cached, query): new ID + the query's exact question bytes
  */
 public class DnsWriter {
 
@@ -97,7 +98,87 @@ public class DnsWriter {
         return copy;
     }
 
+    /**
+     * Returns a copy of a cached response with every RR TTL reduced by ageSeconds (floored at 0).
+     * Walks the packet without a full parse: skip the header and questions, then for each record
+     * skip the owner name and patch the 4 TTL bytes in place. OPT (EDNS0) pseudo-records are left
+     * alone because their "TTL" field actually holds extended flags.
+     * If the packet is malformed the original bytes are returned unchanged.
+     */
+    public static byte[] adjustTtl(byte[] response, long ageSeconds) {
+        byte[] out = response.clone();
+        if (ageSeconds <= 0 || out.length < DnsHeader.SIZE) return out;
+        try {
+            int qd = readU16(out, 4);
+            int rr = readU16(out, 6) + readU16(out, 8) + readU16(out, 10);
+            int pos = DnsHeader.SIZE;
+            for (int i = 0; i < qd; i++) pos = skipName(out, pos) + 4; // QTYPE + QCLASS
+            for (int i = 0; i < rr; i++) {
+                pos = skipName(out, pos);
+                int type = readU16(out, pos);
+                int ttlPos = pos + 4;
+                int rdLength = readU16(out, pos + 8);
+                if (type != DnsQuestion.TYPE_OPT) {
+                    long ttl = readU32(out, ttlPos);
+                    writeU32(out, ttlPos, Math.max(0, ttl - ageSeconds));
+                }
+                pos += 10 + rdLength;
+                if (pos > out.length) return response.clone();
+            }
+            return out;
+        } catch (ArrayIndexOutOfBoundsException e) {
+            return response.clone();
+        }
+    }
+
+    /**
+     * Turns a cached reply into the reply for a new query:
+     *  - transaction ID = the new query's ID
+     *  - question bytes copied from the new query when they match case-insensitively, so the
+     *    client sees exactly the casing it sent (resolvers using DNS 0x20 randomization check this)
+     */
+    public static byte[] prepareCachedReply(byte[] cached, byte[] query, int queryLength) {
+        byte[] out = rewriteId(cached, readU16(query, 0));
+        try {
+            int qEnd = skipName(query, DnsHeader.SIZE) + 4;
+            int rEnd = skipName(out, DnsHeader.SIZE) + 4;
+            if (qEnd == rEnd && qEnd <= queryLength && rEnd <= out.length) {
+                boolean same = true;
+                for (int i = DnsHeader.SIZE; i < qEnd && same; i++) {
+                    same = Character.toLowerCase((char) (query[i] & 0xFF)) == Character.toLowerCase((char) (out[i] & 0xFF));
+                }
+                if (same) System.arraycopy(query, DnsHeader.SIZE, out, DnsHeader.SIZE, qEnd - DnsHeader.SIZE);
+            }
+        } catch (ArrayIndexOutOfBoundsException ignored) {
+            // keep the cached question as-is
+        }
+        return out;
+    }
+
     // ---------------------------------------------------------------- helpers
+
+    /** Position just past a (possibly compressed) domain name starting at pos. */
+    static int skipName(byte[] b, int pos) {
+        while (true) {
+            int len = b[pos] & 0xFF;
+            if (len == 0) return pos + 1;
+            if ((len & 0xC0) == 0xC0) return pos + 2; // compression pointer ends the name
+            pos += 1 + len;
+        }
+    }
+
+    static int readU16(byte[] b, int offset) {
+        return ((b[offset] & 0xFF) << 8) | (b[offset + 1] & 0xFF);
+    }
+
+    static long readU32(byte[] b, int offset) {
+        return ((long) readU16(b, offset) << 16) | readU16(b, offset + 2);
+    }
+
+    static void writeU32(byte[] b, int offset, long v) {
+        writeU16(b, offset, (int) ((v >> 16) & 0xFFFF));
+        writeU16(b, offset + 2, (int) (v & 0xFFFF));
+    }
 
     static void writeName(ByteArrayOutputStream out, String name) {
         if (name != null && !name.isEmpty() && !name.equals(".")) {

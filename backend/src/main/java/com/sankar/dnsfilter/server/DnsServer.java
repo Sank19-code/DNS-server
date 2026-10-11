@@ -29,7 +29,7 @@ public class DnsServer {
     public DnsServer(Config config, Blocklist blocklist, DnsCache cache,
                      UpstreamResolver upstream, StatsCollector stats) {
         this.config = config;
-        this.handler = new QueryHandler(blocklist, cache, upstream, stats);
+        this.handler = new QueryHandler(blocklist, cache, upstream, stats, QueryHandler.Settings.from(config));
     }
 
     public void start() throws Exception {
