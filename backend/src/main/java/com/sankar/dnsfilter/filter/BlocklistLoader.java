@@ -59,7 +59,7 @@ public class BlocklistLoader {
     }
 
     /** Normalizes a single domain; returns null if it isn't a valid blockable domain. */
-    static String clean(String d) {
+    public static String clean(String d) {
         d = d.trim().toLowerCase();
         if (d.endsWith(".")) d = d.substring(0, d.length() - 1);
         if (d.startsWith("*.")) d = d.substring(2); // wildcard = parent match, which we do anyway

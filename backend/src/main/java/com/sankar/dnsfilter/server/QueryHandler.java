@@ -71,7 +71,30 @@ public class QueryHandler {
         this.settings = settings;
     }
 
+    /** Outcome of one query: the reply bytes (null = drop) plus what the pipeline decided. */
+    public static final class Result {
+        public final byte[] reply;
+        public final QueryLogEntry.Status status;   // null when the packet was dropped/FORMERR
+        public final String category;
+        public final long latencyMicros;
+
+        Result(byte[] reply, QueryLogEntry.Status status, String category, long latencyMicros) {
+            this.reply = reply;
+            this.status = status;
+            this.category = category;
+            this.latencyMicros = latencyMicros;
+        }
+    }
+
+    public UpstreamResolver upstream() { return upstream; }
+
+    /** Called by DnsServer for every UDP packet. */
     public byte[] handle(byte[] query, String clientIp) {
+        return resolve(query, clientIp).reply;
+    }
+
+    /** Same pipeline, but also reports the decision - used by the HTTP "test a domain" endpoint. */
+    public Result resolve(byte[] query, String clientIp) {
         long start = System.nanoTime();
 
         // 1. Parse. Malformed packets get FORMERR (if we can at least read the header) or are dropped.
@@ -80,11 +103,11 @@ public class QueryHandler {
             msg = new DnsParser(query, query.length).parseQuery();
         } catch (DnsParseException e) {
             System.err.println("Malformed query from " + clientIp + ": " + e.getMessage());
-            return formErr(query);
+            return new Result(formErr(query), null, null, (System.nanoTime() - start) / 1000);
         }
         if (msg.header.isResponse() || msg.questions.isEmpty()) {
             System.err.println("Ignoring non-query packet from " + clientIp + ": " + msg.header);
-            return null;
+            return new Result(null, null, null, (System.nanoTime() - start) / 1000);
         }
 
         DnsQuestion q = msg.questions.get(0);
@@ -166,7 +189,7 @@ public class QueryHandler {
         return 0;
     }
 
-    private byte[] finish(byte[] reply, long start, String clientIp, String domain, String type,
+    private Result finish(byte[] reply, long start, String clientIp, String domain, String type,
                           QueryLogEntry.Status status, String category, String outcome) {
         long micros = (System.nanoTime() - start) / 1000;
         if (settings.logQueries) {
@@ -175,7 +198,7 @@ public class QueryHandler {
         }
         // 5. Record for the dashboard.
         stats.record(new QueryLogEntry(clientIp, domain, type, status, category, micros));
-        return reply;
+        return new Result(reply, status, category, micros);
     }
 
     /** FORMERR reply if the 12-byte header is readable, otherwise drop the packet. */

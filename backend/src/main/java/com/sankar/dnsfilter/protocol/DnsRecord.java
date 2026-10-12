@@ -12,14 +12,19 @@ public class DnsRecord {
     public byte[] rdata;    // raw RDATA (4 bytes for A, 16 for AAAA, ...)
     public String rdataText; // decoded form when we know how (IP address, CNAME target)
 
-    @Override
-    public String toString() {
+    /** RDATA as text: IP for A/AAAA, target for CNAME/NS/PTR, else "<n> bytes". */
+    public String data() {
         String data = rdataText;
         if (data == null && (type == DnsQuestion.TYPE_A || type == DnsQuestion.TYPE_AAAA) && rdata != null) {
             try { data = InetAddress.getByAddress(rdata).getHostAddress(); }
             catch (UnknownHostException e) { data = "?"; }
         }
         if (data == null) data = (rdata == null ? 0 : rdata.length) + " bytes";
-        return name + " " + ttl + " " + DnsQuestion.typeName(type) + " " + data;
+        return data;
+    }
+
+    @Override
+    public String toString() {
+        return name + " " + ttl + " " + DnsQuestion.typeName(type) + " " + data();
     }
 }

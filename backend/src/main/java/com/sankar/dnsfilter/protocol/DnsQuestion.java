@@ -42,6 +42,21 @@ public class DnsQuestion {
         }
     }
 
+    /** Inverse of typeName: "AAAA" -> 28, "TYPE99" or "99" -> 99, unknown -> -1. */
+    public static int typeCode(String name) {
+        String n = name.trim().toUpperCase();
+        for (int t : new int[]{TYPE_A, TYPE_NS, TYPE_CNAME, TYPE_SOA, TYPE_PTR, TYPE_MX, TYPE_TXT,
+                TYPE_AAAA, TYPE_SRV, TYPE_HTTPS}) {
+            if (typeName(t).equals(n)) return t;
+        }
+        try {
+            int v = Integer.parseInt(n.startsWith("TYPE") ? n.substring(4) : n);
+            return v >= 1 && v <= 65535 ? v : -1;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
     @Override
     public String toString() { return name + " " + typeName(type); }
 }
