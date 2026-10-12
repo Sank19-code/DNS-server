@@ -1,6 +1,7 @@
 package com.sankar.dnsfilter.filter;
 
 import com.sankar.dnsfilter.config.Config;
+import com.sankar.dnsfilter.protocol.DnsNames;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -78,7 +79,9 @@ public class Blocklist {
                 List<String> domains = RemoteBlocklist.fetch(src,
                         Paths.get(config.get("blocklist.cacheDir", "../blocklists/downloaded")),
                         forceDownload ? 0 : config.getInt("blocklist.refreshHours", 24),
-                        config.getInt("blocklist.downloadTimeoutMs", 15000));
+                        config.getInt("blocklist.downloadTimeoutMs", 15000),
+                        config.getInt("blocklist.maxDownloadMb", 50) * 1024L * 1024L,
+                        config.getInt("blocklist.minKeepPercent", 50) / 100.0);
                 for (String d : domains) newBlocked.put(d, src.category);
             }
 
@@ -134,10 +137,10 @@ public class Blocklist {
             if (a.contains(d)) return null;
             String category = b.get(d);
             if (category != null) return category;
-            int dot = d.indexOf('.');
+            int dot = DnsNames.firstDot(d);               // skips an escaped "\." inside a label
             if (dot < 0) return null;
             String parent = d.substring(dot + 1);
-            if (parent.indexOf('.') < 0) return null; // parent is a TLD
+            if (DnsNames.firstDot(parent) < 0) return null; // parent is a TLD
             d = parent;
         }
     }
@@ -183,6 +186,19 @@ public class Blocklist {
     }
 
     public boolean isListed(String domain) { return blocked.containsKey(normalize(domain)); }
+
+    /** True if the domain or one of its parents is on the allowlist. */
+    public boolean isAllowlisted(String domain) {
+        if (domain == null || domain.isEmpty()) return false;
+        Set<String> a = allowed;
+        String d = normalize(domain);
+        while (true) {
+            if (a.contains(d)) return true;
+            int dot = DnsNames.firstDot(d);
+            if (dot < 0) return false;
+            d = d.substring(dot + 1);
+        }
+    }
     public int size() { return blocked.size(); }
     public int allowedSize() { return allowed.size(); }
     public Set<String> allowedDomains() { return Set.copyOf(allowed); }
@@ -268,8 +284,8 @@ public class Blocklist {
     // ------------------------------------------------------------ helpers
 
     static String normalize(String d) {
-        d = d.trim().toLowerCase();
-        return d.endsWith(".") ? d.substring(0, d.length() - 1) : d;
+        d = DnsNames.lower(d.trim());                        // A-Z only, locale-independent
+        return d.endsWith(".") && !d.endsWith("\\.") ? d.substring(0, d.length() - 1) : d;
     }
 
     static String categoryFromFile(Path path) {

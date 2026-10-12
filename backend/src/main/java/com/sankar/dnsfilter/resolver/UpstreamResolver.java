@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 /**
  * Forwards a raw query to the upstream resolver and returns its raw reply.
@@ -37,7 +38,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * Fallback: upstreams are tried in order (upstream.host, then upstream.fallback); each gets its
  * own timeout. The first good reply wins, and that upstream is tried FIRST from then on. So a
  * laptop moving between networks (campus resolver vs. home) pays the timeout once, not on
- * every query.
+ * every query. "Good" means not SERVFAIL or REFUSED: those mean "this server can't / won't
+ * answer", so the next upstream is asked (the error reply is still returned if nobody does better).
+ * The primary is never demoted for good: once upstream.primaryRetrySec has passed, one query tries
+ * it first again, so after a blip the network's own resolver (which may be the only one that knows
+ * internal names) comes back.
  *
  * TCP: forwardTcp() does the same over TCP (RFC 7766, 2-byte length prefix). It is used for
  * clients that came to us over TCP, typically after a truncated (TC=1) UDP answer.
@@ -46,15 +51,22 @@ public class UpstreamResolver {
     /** Largest possible DNS message; a smaller UDP buffer would silently cut big replies in half. */
     private static final int MAX_MESSAGE = 65_535;
 
+    private static final int RCODE_SERVFAIL = 2;
+    private static final int RCODE_REFUSED = 5;
+
     private final List<InetSocketAddress> upstreams;
     private final int timeoutMs;
     private final int retransmitMs;
+    private final long primaryRetryNanos;
+    private final LongSupplier nanoClock;
     private final SecureRandom random = new SecureRandom();
     private final AtomicLong retransmits = new AtomicLong();
     private final AtomicInteger preferred = new AtomicInteger(); // index of the last upstream that answered
+    private volatile long preferredSince;                        // nanoClock time of the last switch / retry
 
     public UpstreamResolver(Config config) throws Exception {
-        this(buildList(config), config.getInt("upstream.timeoutMs", 1500), config.getInt("upstream.retransmitMs", 500));
+        this(buildList(config), config.getInt("upstream.timeoutMs", 1500), config.getInt("upstream.retransmitMs", 500),
+                config.getInt("upstream.primaryRetrySec", 60), System::nanoTime);
     }
 
     public UpstreamResolver(List<InetSocketAddress> upstreams, int timeoutMs) {
@@ -63,10 +75,19 @@ public class UpstreamResolver {
 
     /** @param retransmitMs resend the query if nothing arrived after this long; 0 disables. */
     public UpstreamResolver(List<InetSocketAddress> upstreams, int timeoutMs, int retransmitMs) {
+        this(upstreams, timeoutMs, retransmitMs, 60, System::nanoTime);
+    }
+
+    /** @param primaryRetrySec how long a demoted primary waits before it's tried first again; 0 = never */
+    UpstreamResolver(List<InetSocketAddress> upstreams, int timeoutMs, int retransmitMs, int primaryRetrySec,
+                     LongSupplier nanoClock) {
         if (upstreams.isEmpty()) throw new IllegalArgumentException("no upstream resolvers configured");
         this.upstreams = List.copyOf(upstreams);
         this.timeoutMs = timeoutMs;
         this.retransmitMs = retransmitMs;
+        this.primaryRetryNanos = TimeUnit.SECONDS.toNanos(primaryRetrySec);
+        this.nanoClock = nanoClock;
+        this.preferredSince = nanoClock.getAsLong();
     }
 
     public List<InetSocketAddress> upstreams() { return upstreams; }
@@ -87,14 +108,32 @@ public class UpstreamResolver {
     private byte[] forward(byte[] query, boolean tcp) throws Exception {
         if (query.length < 12) throw new IllegalArgumentException("query shorter than a DNS header");
         Exception last = null;
-        int start = preferred.get();
+        byte[] errorReply = null;                     // a SERVFAIL / REFUSED, if that's all we get
+        int pref = preferred.get();
+        int start = pref;
+        boolean retryingPrimary = false;
+        long now = nanoClock.getAsLong();
+        if (pref != 0 && primaryRetryNanos > 0 && now - preferredSince >= primaryRetryNanos) {
+            start = 0;                                // give the primary another chance
+            retryingPrimary = true;
+            preferredSince = now;                     // and if it fails, wait a full interval again
+        }
         for (int i = 0; i < upstreams.size(); i++) {
             int idx = (start + i) % upstreams.size();
             InetSocketAddress upstream = upstreams.get(idx);
             try {
                 byte[] reply = tcp ? askTcp(upstream, query) : ask(upstream, query);
-                if (idx != start && preferred.compareAndSet(start, idx)) {
-                    System.out.println("Upstream " + upstream + " is answering; using it first from now on");
+                int rcode = reply[3] & 0x0F;
+                if ((rcode == RCODE_SERVFAIL || rcode == RCODE_REFUSED) && i < upstreams.size() - 1) {
+                    errorReply = reply;
+                    System.err.println("Upstream " + upstream + " answered " + (rcode == RCODE_SERVFAIL ? "SERVFAIL" : "REFUSED")
+                            + ", trying next");
+                    continue;
+                }
+                if (idx != pref && preferred.compareAndSet(pref, idx)) {
+                    preferredSince = nanoClock.getAsLong();
+                    System.out.println("Upstream " + upstream + (retryingPrimary && idx == 0 ? " is back" : " is answering")
+                            + "; using it first from now on");
                 }
                 return reply;
             } catch (Exception e) {
@@ -105,6 +144,7 @@ public class UpstreamResolver {
                 }
             }
         }
+        if (errorReply != null) return errorReply;    // better than a timeout: the client learns at once
         throw last;
     }
 

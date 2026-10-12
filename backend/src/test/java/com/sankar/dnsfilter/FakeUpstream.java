@@ -22,7 +22,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * answer UDP with a truncated (TC=1) reply so the client has to come back over TCP.
  */
 public class FakeUpstream implements AutoCloseable {
-    public enum Mode { NORMAL, SILENT, WRONG_ID_FIRST, WRONG_QUESTION_FIRST, DROP_FIRST, TRUNCATE_UDP }
+    public enum Mode { NORMAL, SILENT, WRONG_ID_FIRST, WRONG_QUESTION_FIRST, DROP_FIRST, TRUNCATE_UDP, SERVFAIL, REFUSED }
+
+    /** When set, names starting with "cloak" are answered as a CNAME to this name, then an A record. */
+    public volatile String cnameTarget;
 
     private final DatagramSocket socket;
     private final ServerSocket tcp;
@@ -103,6 +106,12 @@ public class FakeUpstream implements AutoCloseable {
     }
 
     private byte[] answer(byte[] q) {
+        if (mode == Mode.SERVFAIL) return DnsWriter.buildErrorResponse(q, q.length, DnsHeader.RCODE_SERVFAIL);
+        if (mode == Mode.REFUSED) return DnsWriter.buildErrorResponse(q, q.length, 5);
+        String target = cnameTarget;
+        if (target != null && q.length > 18 && new String(q, 13, 5, java.nio.charset.StandardCharsets.ISO_8859_1).equals("cloak")) {
+            return cnameReply(q, target, answerTtl);
+        }
         byte[] reply = isNx(q) ? nxWithSoa(q) : DnsWriter.buildNullRouteResponse(q, q.length, answerTtl);
         if (padding <= 0) return reply;
         // pad with a TXT-ish additional record so the reply gets big
@@ -122,7 +131,38 @@ public class FakeUpstream implements AutoCloseable {
         return q.length > 14 && q[13] == 'n' && q[14] == 'x';
     }
 
-    /** NXDOMAIN with an SOA (TTL 900) in the authority section, like real resolvers send. */
+    /** "query name CNAME target; target A 0.0.0.0" - how a CNAME-cloaked tracker looks. */
+    public static byte[] cnameReply(byte[] q, String target, long ttl) {
+        byte[] base = DnsWriter.buildErrorResponse(q, q.length, DnsHeader.RCODE_NOERROR);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(base, 0, base.length);
+        ByteArrayOutputStream name = new ByteArrayOutputStream();
+        for (String label : target.split("\\.")) {
+            name.write(label.length());
+            name.writeBytes(label.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        }
+        name.write(0);
+        byte[] targetWire = name.toByteArray();
+        int targetOffset = base.length + 12;                  // where the CNAME's RDATA starts
+        out.write(0xC0); out.write(0x0C);                     // owner = question name
+        out.write(0); out.write(5); out.write(0); out.write(1);  // CNAME IN
+        writeTtl(out, ttl);
+        out.write(targetWire.length >> 8); out.write(targetWire.length);
+        out.write(targetWire, 0, targetWire.length);
+        out.write(0xC0 | (targetOffset >> 8)); out.write(targetOffset);   // owner = the target
+        out.write(0); out.write(1); out.write(0); out.write(1);  // A IN
+        writeTtl(out, ttl);
+        out.write(0); out.write(4); out.write(new byte[4], 0, 4);
+        byte[] r = out.toByteArray();
+        r[7] = 2;                                             // ANCOUNT = 2
+        return r;
+    }
+
+    private static void writeTtl(ByteArrayOutputStream out, long ttl) {
+        out.write((int) (ttl >> 24)); out.write((int) (ttl >> 16)); out.write((int) (ttl >> 8)); out.write((int) ttl);
+    }
+
+    /** NXDOMAIN with an SOA (TTL 900, MINIMUM 60) in the authority section, like real resolvers send. */
     public static byte[] nxWithSoa(byte[] q) {
         byte[] base = DnsWriter.buildErrorResponse(q, q.length, DnsHeader.RCODE_NXDOMAIN);
         ByteArrayOutputStream out = new ByteArrayOutputStream();

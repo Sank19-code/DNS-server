@@ -80,10 +80,15 @@ public class TcpDnsServer {
     /** Binds and starts accepting in a background thread. Returns the bound port. */
     public int start() throws IOException {
         int port = config.getInt("dns.port", 5300);
-        String bind = config.get("dns.bind", "0.0.0.0").trim();
-        server = new ServerSocket();
-        server.setReuseAddress(true);
-        server.bind(new InetSocketAddress(bind, port), 50);
+        String bind = config.get("dns.bind", "::").trim();
+        try {
+            server = bindTcp(bind, port);
+        } catch (IOException e) {
+            if (!bind.equals("::")) throw e;
+            System.err.println("IPv6 unavailable (" + e.getMessage() + "), TCP listening on IPv4 only");
+            bind = "0.0.0.0";
+            server = bindTcp(bind, port);
+        }
         Thread acceptor = new Thread(this::acceptLoop, "dns-tcp-accept");
         acceptor.setDaemon(true);
         acceptor.start();
@@ -92,12 +97,24 @@ public class TcpDnsServer {
         return server.getLocalPort();
     }
 
+    private static ServerSocket bindTcp(String bind, int port) throws IOException {
+        ServerSocket s = new ServerSocket();
+        try {
+            s.setReuseAddress(true);
+            s.bind(new InetSocketAddress(bind, port), 50);
+            return s;
+        } catch (IOException e) {
+            s.close();
+            throw e;
+        }
+    }
+
     private void acceptLoop() {
         ServerSocket s = server;
         while (!s.isClosed()) {
             try {
                 Socket client = s.accept();
-                String ip = client.getInetAddress().getHostAddress();
+                String ip = Admission.clientKey(client.getInetAddress());   // IPv6: per /64
                 int open = perClient.merge(ip, 1, Integer::sum);   // atomic per key
                 if (open > maxPerClient) {                           // one IP can't take every slot
                     release(ip);
@@ -149,6 +166,7 @@ public class TcpDnsServer {
             }
         } catch (SocketTimeoutException e) {
             timedOut.incrementAndGet();                       // query trickled in too slowly
+            admission.stats().recordTcpTimedOut();
         } catch (IOException e) {
             // connection reset, or closed by the write watchdog - nothing to answer
         } catch (RuntimeException e) {
@@ -196,6 +214,7 @@ public class TcpDnsServer {
         writeDeadlines.forEach((socket, deadline) -> {
             if (now - deadline > 0 && writeDeadlines.remove(socket, deadline)) {
                 timedOut.incrementAndGet();
+                admission.stats().recordTcpTimedOut();
                 closeQuietly(socket);
             }
         });
@@ -207,6 +226,7 @@ public class TcpDnsServer {
 
     private void refuse(Socket client) {
         refused.incrementAndGet();
+        admission.stats().recordTcpRefused();
         closeQuietly(client);
     }
 

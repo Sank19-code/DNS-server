@@ -84,6 +84,7 @@ import java.util.regex.Pattern;
  */
 public class ApiServer {
     private static final int MAX_BODY_BYTES = 4096;
+    static final int MIN_TOKEN_LENGTH = 16;
     private static final Pattern CATEGORY = Pattern.compile("^[a-z0-9_-]{1,32}$");
     private static final Pattern IPV4 = Pattern.compile("^\\d{1,3}(\\.\\d{1,3}){3}$");
 
@@ -115,6 +116,11 @@ public class ApiServer {
         this.resolveLimiter = new RateLimiter(config.getInt("api.resolve.qps", 5), config.getInt("api.resolve.burst", 20));
         String token = config.get("api.token", ""); // env DNSFILTER_API_TOKEN overrides (see Config)
         this.adminToken = token.isBlank() ? null : token.trim();
+        if (adminToken != null && adminToken.length() < MIN_TOKEN_LENGTH) {
+            // Nothing slows down guessing (no lockout), so the token itself has to be strong.
+            throw new IllegalStateException("api.token is too short (" + adminToken.length() + " characters, need "
+                    + MIN_TOKEN_LENGTH + "+). Generate one with: openssl rand -hex 24");
+        }
         this.publicReads = Boolean.parseBoolean(config.get("api.publicReads", "false").trim());
         this.insecure = Boolean.parseBoolean(config.get("api.insecure", "false").trim());
         this.allowedHosts = new HashSet<>();
@@ -232,6 +238,9 @@ public class ApiServer {
         b.put("errors", stats.errors());
         b.put("rateLimited", stats.rateLimited());
         b.put("upstreamBusy", handler.upstreamBusy());
+        b.put("overloadDrops", stats.overloadDrops());
+        b.put("tcpRefused", stats.tcpRefused());
+        b.put("tcpTimedOut", stats.tcpTimedOut());
         b.put("blockedPercent", percent(stats.blocked(), total));
         b.put("blocklistSize", blocklist.size());
         b.put("allowlistSize", blocklist.allowedSize());
@@ -587,6 +596,7 @@ public class ApiServer {
         ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
         ex.getResponseHeaders().set("Cache-Control", "no-store");
         ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        StaticFiles.securityHeaders(ex);
         addCors(ex);
         ex.sendResponseHeaders(status, bytes.length);
         try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }

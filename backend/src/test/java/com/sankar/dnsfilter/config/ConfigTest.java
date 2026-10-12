@@ -53,6 +53,6 @@ class ConfigTest {
         assertEquals(5300, c.getInt("dns.port", 0), "everything else still from config.properties");
 
         Config withoutLocal = Config.load(null, local.resolveSibling("missing.properties"));
-        assertEquals(1000, withoutLocal.getInt("cache.maxEntries", 0));
+        assertEquals(10_000, withoutLocal.getInt("cache.maxEntries", 0), "the bundled default");
     }
 }

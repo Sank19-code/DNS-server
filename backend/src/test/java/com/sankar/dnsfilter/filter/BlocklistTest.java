@@ -183,6 +183,78 @@ class BlocklistTest {
         assertEquals(List.of("cached-ad.com"), RemoteBlocklist.fetch(src, dir, 24, 500));
     }
 
+    /** Serves `body` at http://127.0.0.1:port/list; returns the server (stop it when done). */
+    private static com.sun.net.httpserver.HttpServer serve(String body) throws Exception {
+        com.sun.net.httpserver.HttpServer s = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        s.createContext("/list", ex -> {
+            byte[] b = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(200, b.length);
+            ex.getResponseBody().write(b);
+            ex.close();
+        });
+        s.start();
+        return s;
+    }
+
+    private static String hosts(int n, String prefix) {
+        StringBuilder sb = new StringBuilder("# a hosts file\n");
+        for (int i = 0; i < n; i++) sb.append("0.0.0.0 ").append(prefix).append(i).append(".example\n");
+        return sb.toString();
+    }
+
+    @Test
+    void goodDownloadReplacesTheCachedCopy() throws Exception {
+        com.sun.net.httpserver.HttpServer s = serve(hosts(120, "new"));
+        try {
+            Path dir = Files.createTempDirectory("dl");
+            RemoteBlocklist.Source src = RemoteBlocklist.parseSources(
+                    "ads|http://127.0.0.1:" + s.getAddress().getPort() + "/list").get(0);
+            Files.writeString(dir.resolve("ads-" + Integer.toHexString(src.url.hashCode()) + ".txt"), hosts(100, "old"));
+            List<String> d = RemoteBlocklist.fetch(src, dir, 0, 2000);   // 0 h = always download
+            assertEquals(120, d.size());
+            assertTrue(d.contains("new0.example"));
+        } finally {
+            s.stop(0);
+        }
+    }
+
+    @Test
+    void downloadThatShrinksTooMuchIsRejectedAndTheCacheKept() throws Exception {
+        com.sun.net.httpserver.HttpServer s = serve("<html>rate limited, try later</html>\n0.0.0.0 one.example\n");
+        try {
+            Path dir = Files.createTempDirectory("dl");
+            RemoteBlocklist.Source src = RemoteBlocklist.parseSources(
+                    "ads|http://127.0.0.1:" + s.getAddress().getPort() + "/list").get(0);
+            Path cached = dir.resolve("ads-" + Integer.toHexString(src.url.hashCode()) + ".txt");
+            Files.writeString(cached, hosts(100, "old"));
+            List<String> d = RemoteBlocklist.fetch(src, dir, 0, 2000);
+            assertEquals(100, d.size(), "a 1-domain download doesn't replace a 100-domain list");
+            assertTrue(Files.readString(cached).contains("old99.example"), "cached file untouched");
+            try (var files = Files.list(dir)) {
+                assertEquals(1, files.count(), "no temp file left behind");
+            }
+        } finally {
+            s.stop(0);
+        }
+    }
+
+    @Test
+    void oversizedDownloadIsAborted() throws Exception {
+        com.sun.net.httpserver.HttpServer s = serve(hosts(500, "big"));     // ~12 KB
+        try {
+            Path dir = Files.createTempDirectory("dl");
+            RemoteBlocklist.Source src = RemoteBlocklist.parseSources(
+                    "ads|http://127.0.0.1:" + s.getAddress().getPort() + "/list").get(0);
+            assertTrue(RemoteBlocklist.fetch(src, dir, 0, 2000, 1_000, 0.5).isEmpty(), "over the 1,000-byte limit");
+            try (var files = Files.list(dir)) {
+                assertEquals(0, files.count(), "nothing cached, no temp file left");
+            }
+        } finally {
+            s.stop(0);
+        }
+    }
+
     @Test
     void remoteFetchFailureWithNoCacheIsEmptyNotFatal() throws Exception {
         Path dir = Files.createTempDirectory("dl");

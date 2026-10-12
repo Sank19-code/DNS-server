@@ -1,6 +1,5 @@
 package com.sankar.dnsfilter.protocol;
 
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
@@ -137,6 +136,11 @@ public class DnsParser {
      * plus the next byte form a 14-bit offset into the packet. After the FIRST jump,
      * the caller's position continues right after the 2-byte pointer, not after the
      * jumped-to name.
+     *
+     * A '.' or '\' byte INSIDE a label is escaped as "\." / "\\" (RFC 1035 presentation format).
+     * Without that, the one-label name [10]www.google[3]com and the real [3]www[6]google[3]com
+     * would both read as "www.google.com" - the same cache key - and anyone could plant an answer
+     * (e.g. NXDOMAIN) for a name they didn't really ask about.
      */
     String readName() {
         StringBuilder name = new StringBuilder();
@@ -168,7 +172,11 @@ public class DnsParser {
             if (wireLength > MAX_NAME_LENGTH) throw new DnsParseException("name longer than 255 bytes");
 
             if (name.length() > 0) name.append('.');
-            name.append(new String(buf, cursor, len, StandardCharsets.ISO_8859_1));
+            for (int i = cursor; i < cursor + len; i++) {
+                char c = (char) (buf[i] & 0xFF);                // ISO-8859-1: one byte, one char
+                if (c == '.' || c == '\\') name.append('\\');
+                name.append(c);
+            }
             cursor += len;
         }
 

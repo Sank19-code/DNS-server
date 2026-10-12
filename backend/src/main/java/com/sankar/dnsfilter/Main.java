@@ -37,7 +37,7 @@ public class Main {
         Blocklist blocklist = new Blocklist();
         blocklist.loadFromConfig(config);
 
-        DnsCache cache = new DnsCache(config.getInt("cache.maxEntries", 1000));
+        DnsCache cache = new DnsCache(config.getInt("cache.maxEntries", 10_000));
         UpstreamResolver upstream = new UpstreamResolver(config);
         StatsCollector stats = new StatsCollector();
         String statsFile = config.get("stats.file", "").trim();

@@ -28,6 +28,23 @@ class AdmissionTest {
     }
 
     @Test
+    void ipv6ClientsAreLimitedPerSlash64() throws Exception {
+        InetAddress a = InetAddress.getByName("2001:db8:1:2::1");
+        InetAddress b = InetAddress.getByName("2001:db8:1:2:ffff:ffff:ffff:ffff");   // same /64, other address
+        InetAddress c = InetAddress.getByName("2001:db8:1:3::1");                    // next /64
+        assertEquals(Admission.clientKey(a), Admission.clientKey(b));
+        assertNotEquals(Admission.clientKey(a), Admission.clientKey(c));
+        assertEquals("10.1.2.3", Admission.clientKey(InetAddress.getByName("10.1.2.3")));
+
+        Admission adm = new Admission(new RateLimiter(1, 2, 100, now::get),
+                RateLimiter.global(1000, 1000, now::get), true, stats);
+        assertTrue(adm.admit(a));
+        assertTrue(adm.admit(b));
+        assertFalse(adm.admit(InetAddress.getByName("2001:db8:1:2::abcd")), "rotating addresses in the /64 doesn't help");
+        assertTrue(adm.admit(c));
+    }
+
+    @Test
     void perClientLimitAppliesFirstAndLoopbackIsExempt() throws Exception {
         Admission a = new Admission(new RateLimiter(1, 2, 100, now::get),
                 RateLimiter.global(1000, 1000, now::get), true, stats);

@@ -40,6 +40,17 @@ class StaticFiles implements HttpHandler {
         this.root = root.toAbsolutePath().normalize();
     }
 
+    /**
+     * No other site may show the dashboard in a frame. Otherwise a page could lay an invisible
+     * dashboard over its own buttons and trick a click on "Block" or "Flush cache" (clickjacking).
+     * X-Frame-Options for older browsers, CSP frame-ancestors for current ones.
+     */
+    static void securityHeaders(HttpExchange ex) {
+        ex.getResponseHeaders().set("X-Frame-Options", "DENY");
+        ex.getResponseHeaders().set("Content-Security-Policy", "frame-ancestors 'none'");
+        ex.getResponseHeaders().set("Referrer-Policy", "no-referrer");
+    }
+
     @Override
     public void handle(HttpExchange ex) throws IOException {
         try {
@@ -79,9 +90,10 @@ class StaticFiles implements HttpHandler {
                 }
             }
             String name = file.getFileName().toString();
-            String ext = name.contains(".") ? name.substring(name.lastIndexOf('.') + 1).toLowerCase() : "";
+            String ext = name.contains(".") ? name.substring(name.lastIndexOf('.') + 1).toLowerCase(java.util.Locale.ROOT) : "";
             ex.getResponseHeaders().set("Content-Type", TYPES.getOrDefault(ext, "application/octet-stream"));
             ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+            securityHeaders(ex);
             ex.getResponseHeaders().set("Cache-Control",
                     rel.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-cache");
             byte[] body = Files.readAllBytes(file);

@@ -225,22 +225,22 @@ class ApiServerTest {
 
     @Test
     void adminTokenProtectsMutationsAndReads() throws Exception {
-        base = startApi("api.token=s3cret\n");
+        base = startApi("api.token=s3cret-token-0123456789\n");
         String body = "{\"domain\":\"evil.com\"}";
         assertEquals(401, send("POST", "/blocklist", body, null).statusCode());
         assertEquals(401, send("POST", "/blocklist", body, "wrong").statusCode());
         assertEquals(401, send("DELETE", "/cache", null, null).statusCode());
-        assertEquals(201, send("POST", "/blocklist", body, "s3cret").statusCode());
+        assertEquals(201, send("POST", "/blocklist", body, "s3cret-token-0123456789").statusCode());
         // the query log is browsing history: reads need the token too
         assertEquals(401, send("GET", "/queries", null, null).statusCode());
         assertEquals(401, send("GET", "/stats", null, null).statusCode());
-        assertEquals(200, send("GET", "/stats", null, "s3cret").statusCode());
+        assertEquals(200, send("GET", "/stats", null, "s3cret-token-0123456789").statusCode());
         assertEquals(200, send("GET", "/health", null, null).statusCode(), "health stays open for monitoring");
     }
 
     @Test
     void publicReadsKeepsGetsOpenButNotMutations() throws Exception {
-        base = startApi("api.token=s3cret\napi.publicReads=true\n");
+        base = startApi("api.token=s3cret-token-0123456789\napi.publicReads=true\n");
         assertEquals(200, send("GET", "/queries", null, null).statusCode());
         assertEquals(401, send("POST", "/blocklist", "{\"domain\":\"evil.com\"}", null).statusCode());
     }
@@ -304,7 +304,7 @@ class ApiServerTest {
         IllegalStateException e = assertThrows(IllegalStateException.class, open::start);
         assertTrue(e.getMessage().contains("DNSFILTER_API_TOKEN"));
 
-        Files.writeString(cfg, "api.port=0\napi.bind=0.0.0.0\napi.token=s3cret\n");
+        Files.writeString(cfg, "api.port=0\napi.bind=0.0.0.0\napi.token=s3cret-token-0123456789\n");
         ApiServer withToken = new ApiServer(Config.load(cfg.toString()), stats, blocklist, cache, handler);
         withToken.start();
         withToken.stop();
@@ -373,14 +373,46 @@ class ApiServerTest {
     @Test
     void reloadEndpointRunsTheReloadAndNeedsTheToken() throws Exception {
         int[] reloads = {0};
-        base = startApi("api.token=s3cret\n");
+        base = startApi("api.token=s3cret-token-0123456789\n");
         api.onReloadBlocklists(() -> reloads[0]++);
         assertEquals(401, send("POST", "/blocklist/reload", null, null).statusCode());
-        HttpResponse<String> r = send("POST", "/blocklist/reload", null, "s3cret");
+        HttpResponse<String> r = send("POST", "/blocklist/reload", null, "s3cret-token-0123456789");
         assertEquals(200, r.statusCode(), r.body());
         assertEquals(1, reloads[0]);
         assertEquals(1, JsonParser.parseString(r.body()).getAsJsonObject().get("size").getAsInt());
-        assertEquals(405, send("GET", "/blocklist/reload", null, "s3cret").statusCode());
+        assertEquals(405, send("GET", "/blocklist/reload", null, "s3cret-token-0123456789").statusCode());
+    }
+
+    @Test
+    void responsesCannotBeFramedByOtherSites() throws Exception {
+        HttpResponse<String> r = send("GET", "/health", null, null);
+        assertEquals("DENY", r.headers().firstValue("X-Frame-Options").orElse(""));
+        assertEquals("frame-ancestors 'none'", r.headers().firstValue("Content-Security-Policy").orElse(""));
+
+        Path dist = Files.createTempDirectory("dist");
+        Files.writeString(dist.resolve("index.html"), "<html>dashboard</html>");
+        base = startApi("api.staticDir=" + dist.toAbsolutePath().toString().replace('\\', '/') + "\n");
+        HttpResponse<String> page = raw(base.substring(0, base.length() - "/api".length()) + "/");
+        assertEquals("DENY", page.headers().firstValue("X-Frame-Options").orElse(""), "the dashboard page itself");
+    }
+
+    @Test
+    void shortTokensAreRefused() throws Exception {
+        Path cfg = Files.createTempFile("api", ".properties");
+        Files.writeString(cfg, "api.port=0\napi.bind=127.0.0.1\napi.token=abc123\n");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> new ApiServer(Config.load(cfg.toString()), stats, blocklist, cache, handler));
+        assertTrue(e.getMessage().contains("too short"));
+    }
+
+    @Test
+    void statsExposeDropAndRefusalCounters() throws Exception {
+        stats.recordOverloadDrop();
+        stats.recordTcpRefused();
+        JsonObject s = get("/stats").getAsJsonObject();
+        assertEquals(1, s.get("overloadDrops").getAsLong());
+        assertEquals(1, s.get("tcpRefused").getAsLong());
+        assertEquals(0, s.get("tcpTimedOut").getAsLong());
     }
 
     @Test

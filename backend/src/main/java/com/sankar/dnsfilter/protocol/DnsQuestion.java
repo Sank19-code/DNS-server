@@ -44,7 +44,7 @@ public class DnsQuestion {
 
     /** Inverse of typeName: "AAAA" -> 28, "TYPE99" or "99" -> 99, unknown -> -1. */
     public static int typeCode(String name) {
-        String n = name.trim().toUpperCase();
+        String n = name.trim().toUpperCase(java.util.Locale.ROOT);
         for (int t : new int[]{TYPE_A, TYPE_NS, TYPE_CNAME, TYPE_SOA, TYPE_PTR, TYPE_MX, TYPE_TXT,
                 TYPE_AAAA, TYPE_SRV, TYPE_HTTPS}) {
             if (typeName(t).equals(n)) return t;

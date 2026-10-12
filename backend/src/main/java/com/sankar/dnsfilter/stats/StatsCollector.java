@@ -37,6 +37,9 @@ public class StatsCollector {
     private final LongAdder total = new LongAdder();
     private final EnumMap<QueryLogEntry.Status, LongAdder> byStatus = new EnumMap<>(QueryLogEntry.Status.class);
     private final LongAdder rateLimited = new LongAdder();
+    private final LongAdder overloadDrops = new LongAdder();   // UDP work queue full
+    private final LongAdder tcpRefused = new LongAdder();      // TCP connection limits
+    private final LongAdder tcpTimedOut = new LongAdder();     // slow / stuck TCP clients cut off
 
     private final Map<String, LongAdder> domainCounts = new ConcurrentHashMap<>();   // allowed queries
     private final Map<String, LongAdder> blockedCounts = new ConcurrentHashMap<>();  // blocked queries
@@ -83,6 +86,14 @@ public class StatsCollector {
 
     /** A packet dropped by the per-client rate limiter (it never reaches the pipeline). */
     public void recordRateLimited() { rateLimited.increment(); }
+
+    /** A packet dropped because every worker was busy and the queue was full. */
+    public void recordOverloadDrop() { overloadDrops.increment(); }
+    public void recordTcpRefused() { tcpRefused.increment(); }
+    public void recordTcpTimedOut() { tcpTimedOut.increment(); }
+    public long overloadDrops() { return overloadDrops.sum(); }
+    public long tcpRefused() { return tcpRefused.sum(); }
+    public long tcpTimedOut() { return tcpTimedOut.sum(); }
 
     /** Newest first, at most `limit` entries. */
     public List<QueryLogEntry> recent(int limit) {

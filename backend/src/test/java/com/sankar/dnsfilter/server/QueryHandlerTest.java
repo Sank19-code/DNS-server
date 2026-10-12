@@ -10,6 +10,7 @@ import com.sankar.dnsfilter.protocol.DnsQuestion;
 import com.sankar.dnsfilter.protocol.DnsWriter;
 import com.sankar.dnsfilter.protocol.DnsWriterEdnsTest;
 import com.sankar.dnsfilter.resolver.UpstreamResolver;
+import com.sankar.dnsfilter.stats.QueryLogEntry;
 import com.sankar.dnsfilter.stats.StatsCollector;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -182,6 +183,100 @@ class QueryHandlerTest {
         upstream.mode = FakeUpstream.Mode.NORMAL;
         assertEquals(1, new DnsParser(capped.handle(DnsWriter.buildQuery(5, "free.com", DnsQuestion.TYPE_A), "127.0.0.1"))
                 .parse().answers.size(), "slots are released after the timeouts");
+    }
+
+    /** A query whose wire labels are given explicitly, so a label can contain a literal '.'. */
+    private static byte[] rawQuery(int id, String... labels) {
+        java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+        o.write(id >> 8); o.write(id); o.write(1); o.write(0); o.write(0); o.write(1);
+        for (int i = 0; i < 6; i++) o.write(0);
+        for (String l : labels) { o.write(l.length()); o.writeBytes(l.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)); }
+        o.write(0); o.write(0); o.write(1); o.write(0); o.write(1);
+        return o.toByteArray();
+    }
+
+    @Test
+    void dottedLabelCannotPoisonTheRealName() {
+        // attacker: ONE label "www.google" under com - a different name that reads the same as text
+        handler.handle(rawQuery(1, "www.google", "com"), "10.0.0.66");
+        // victim: the real www.google.com must get its own lookup, not the attacker's cached answer
+        DnsMessage victim = new DnsParser(handler.handle(rawQuery(2, "www", "google", "com"), "10.0.0.7")).parse();
+        assertEquals(2, upstream.queries.get(), "two different names, two cache entries");
+        assertEquals("www.google.com", victim.questions.get(0).name);
+        assertEquals(2, cache.size());
+    }
+
+    @Test
+    void multiQuestionQueryIsRefusedNotForwarded() {
+        byte[] first = DnsWriter.buildQuery(1, "example.com", DnsQuestion.TYPE_A);
+        byte[] second = DnsWriter.buildQuery(0, "ads.doubleclick.net", DnsQuestion.TYPE_A);
+        byte[] both = java.util.Arrays.copyOf(first, first.length + second.length - 12);
+        System.arraycopy(second, 12, both, first.length, second.length - 12);
+        both[5] = 2;                                             // QDCOUNT = 2
+        byte[] reply = handler.handle(both, "10.0.0.66");
+        assertEquals(DnsHeader.RCODE_FORMERR, reply[3] & 0x0F);
+        assertEquals(0, upstream.queries.get(), "the blocked second question never reaches upstream");
+    }
+
+    @Test
+    void bypassCanariesGetNxdomainEvenInNullRouteMode() {
+        settings.nullRoute = true;
+        for (String canary : new String[]{"use-application-dns.net", "mask.icloud.com", "MASK-H2.icloud.com"}) {
+            DnsMessage m = ask(1, canary, DnsQuestion.TYPE_A);
+            assertEquals(DnsHeader.RCODE_NXDOMAIN, m.header.getRcode(), canary);
+            assertEquals(0, m.answers.size(), "a 0.0.0.0 answer would tell Firefox to go ahead with DoH");
+        }
+        assertEquals(0, upstream.queries.get());
+        settings.blockBypassCanaries = false;
+        assertEquals(DnsHeader.RCODE_NOERROR, ask(2, "use-application-dns.net", DnsQuestion.TYPE_A).header.getRcode());
+    }
+
+    @Test
+    void cnameCloakedTrackerIsBlockedAlsoFromCache() {
+        upstream.cnameTarget = "tracker.adobe-metrics.example";
+        blocklist.add("adobe-metrics.example", "trackers");
+
+        QueryHandler.Result first = handler.resolve(DnsWriter.buildQuery(1, "cloak.news-site.com", DnsQuestion.TYPE_A), "10.0.0.7");
+        assertEquals(QueryLogEntry.Status.BLOCKED, first.status);
+        assertEquals("trackers", first.category);
+        assertEquals(DnsHeader.RCODE_NXDOMAIN, new DnsParser(first.reply).parse().header.getRcode());
+
+        QueryHandler.Result again = handler.resolve(DnsWriter.buildQuery(2, "cloak.news-site.com", DnsQuestion.TYPE_A), "10.0.0.7");
+        assertEquals(QueryLogEntry.Status.BLOCKED, again.status, "the cached answer's alias is re-checked");
+        assertEquals(1, upstream.queries.get());
+
+        blocklist.remove("adobe-metrics.example");               // unblocking the tracker...
+        QueryHandler.Result after = handler.resolve(DnsWriter.buildQuery(3, "cloak.news-site.com", DnsQuestion.TYPE_A), "10.0.0.7");
+        assertEquals(QueryLogEntry.Status.CACHED, after.status, "...takes effect at once, from the cache");
+        assertEquals(2, new DnsParser(after.reply).parse().answers.size());
+    }
+
+    @Test
+    void allowlistedNameSkipsCnameInspection() {
+        upstream.cnameTarget = "cdn.tracker.example";
+        blocklist.add("tracker.example", "trackers");
+        blocklist.allow("cloak.shop.com");
+        assertEquals(QueryLogEntry.Status.FORWARDED,
+                handler.resolve(DnsWriter.buildQuery(1, "cloak.shop.com", DnsQuestion.TYPE_A), "10.0.0.7").status);
+    }
+
+    @Test
+    void negativeTtlUsesTheSoaMinimumField() {
+        byte[] q = DnsWriter.buildQuery(1, "nx-gone.com", DnsQuestion.TYPE_A);
+        DnsMessage nx = new DnsParser(FakeUpstream.nxWithSoa(q)).parse();   // SOA TTL 900, MINIMUM 60
+        assertEquals(60, handler.cacheTtl(nx, nx.questions.get(0)), "min(SOA TTL, MINIMUM, negativeTtl) per RFC 2308");
+    }
+
+    @Test
+    void blockingDoesNotDependOnTheMachineLanguage() {
+        java.util.Locale before = java.util.Locale.getDefault();
+        java.util.Locale.setDefault(new java.util.Locale("tr", "TR"));    // "I".toLowerCase() = dotless "ı"
+        try {
+            DnsMessage m = ask(1, "AD.DOUBLECLICK.NET", DnsQuestion.TYPE_A);
+            assertEquals(DnsHeader.RCODE_NXDOMAIN, m.header.getRcode(), "upper-case I must still match");
+        } finally {
+            java.util.Locale.setDefault(before);
+        }
     }
 
     @Test

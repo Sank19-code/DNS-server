@@ -145,7 +145,7 @@ public class DnsWriter {
             if (qEnd == rEnd && qEnd <= queryLength && rEnd <= out.length) {
                 boolean same = true;
                 for (int i = DnsHeader.SIZE; i < qEnd && same; i++) {
-                    same = Character.toLowerCase((char) (query[i] & 0xFF)) == Character.toLowerCase((char) (out[i] & 0xFF));
+                    same = asciiLower(query[i]) == asciiLower(out[i]);   // A-Z only (RFC 4343)
                 }
                 if (same) System.arraycopy(query, DnsHeader.SIZE, out, DnsHeader.SIZE, qEnd - DnsHeader.SIZE);
             }

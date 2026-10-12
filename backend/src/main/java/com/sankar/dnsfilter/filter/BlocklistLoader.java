@@ -1,5 +1,7 @@
 package com.sankar.dnsfilter.filter;
 
+import com.sankar.dnsfilter.protocol.DnsNames;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -60,7 +62,7 @@ public class BlocklistLoader {
 
     /** Normalizes a single domain; returns null if it isn't a valid blockable domain. */
     public static String clean(String d) {
-        d = d.trim().toLowerCase();
+        d = DnsNames.lower(d.trim());                        // A-Z only, locale-independent
         if (d.endsWith(".")) d = d.substring(0, d.length() - 1);
         if (d.startsWith("*.")) d = d.substring(2); // wildcard = parent match, which we do anyway
         if (HOSTS_NOISE.contains(d) || !DOMAIN.matcher(d).matches()) return null;

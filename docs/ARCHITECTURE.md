@@ -108,6 +108,21 @@
   bytes instead of ~68×. Bigger answers go TC=1 → TCP, which can't be spoofed.
 - **Fail fast under load.** An instant SERVFAIL beats an answer after a 4.5 s wait: the client
   retries or tries its next resolver, and the worker is free for the next query.
+- **Names as text are exact.** The parser writes a `.` or `\` inside a label as `\.` / `\\`
+  (presentation format), so text ↔ wire name is one-to-one and the cache key can't be shared by
+  two different names. Case folding is ASCII A-Z only (`DnsNames.lower`), as DNS defines it
+  (RFC 4343), instead of Java's locale-dependent `toLowerCase()`.
+- **Exactly one question.** Anything else gets FORMERR (RFC 9619). The blocklist checks one
+  name; forwarding a second unchecked question would bypass it.
+- **CNAME inspection, also on cache hits.** The CNAME targets of an answer are stored next to it
+  in the cache and checked against the blocklist on every hit (a few hash lookups). So blocking a
+  tracker immediately covers cached answers that point at it, and unblocking it un-blocks them.
+- **An error reply is not an answer.** SERVFAIL / REFUSED from one upstream moves on to the next;
+  only if all fail is the error passed on. A demoted primary is retried every 60 s, because the
+  network's own resolver may be the only one that knows its internal names.
+- **Trust downloads only after checking them.** A blocklist download streams to a temp file
+  (size-capped, time-capped), is parsed, and only replaces the cached copy if it isn't empty and
+  has at least half as many domains. A "200 OK" error page can't wipe out the list.
 - **The API is private by default.** The query log is browsing history. The API binds to
   127.0.0.1, refuses a wider bind without `DNSFILTER_API_TOKEN`, and with a token checks it
   (in constant time) on reads as well as writes. Browser attacks are blocked separately because

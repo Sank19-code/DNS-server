@@ -1,6 +1,9 @@
 package com.sankar.dnsfilter.cache;
 
+import com.sankar.dnsfilter.protocol.DnsNames;
 import com.sankar.dnsfilter.protocol.DnsWriter;
+
+import java.util.List;
 
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -30,8 +33,8 @@ public class DnsCache {
     }
 
     public static String key(String name, int type) {
-        String n = name.toLowerCase();
-        if (n.endsWith(".")) n = n.substring(0, n.length() - 1);
+        String n = DnsNames.lower(name);                     // A-Z only, locale-independent
+        if (n.endsWith(".") && !n.endsWith("\\.")) n = n.substring(0, n.length() - 1);
         return n + ":" + type;
     }
 
@@ -46,8 +49,21 @@ public class DnsCache {
         return base + (edns.dnssecOk ? ":do" : ":e");
     }
 
+    /** A cache hit: the reply (TTLs already aged) and the CNAME aliases it contains. */
+    public static final class Hit {
+        public final byte[] reply;
+        public final List<String> aliases;
+        Hit(byte[] reply, List<String> aliases) { this.reply = reply; this.aliases = aliases; }
+    }
+
     /** @return a copy of the cached reply with TTLs aged, or null on miss / expiry. */
     public byte[] get(String key) {
+        Hit h = lookup(key);
+        return h == null ? null : h.reply;
+    }
+
+    /** Like get(), plus the aliases, so the caller can re-check them against the blocklist. */
+    public Hit lookup(String key) {
         long now = clock.getAsLong();
         CacheEntry e = lru.get(key);
         if (e == null) {
@@ -60,12 +76,16 @@ public class DnsCache {
             return null;
         }
         hits.incrementAndGet();
-        return DnsWriter.adjustTtl(e.response, e.ageSeconds(now));
+        return new Hit(DnsWriter.adjustTtl(e.response, e.ageSeconds(now)), e.aliases);
     }
 
     public void put(String key, byte[] response, long ttlSeconds) {
+        put(key, response, ttlSeconds, List.of());
+    }
+
+    public void put(String key, byte[] response, long ttlSeconds, List<String> aliases) {
         if (ttlSeconds <= 0 || response == null) return;
-        lru.put(key, new CacheEntry(response.clone(), ttlSeconds, clock.getAsLong()));
+        lru.put(key, new CacheEntry(response.clone(), ttlSeconds, clock.getAsLong(), aliases));
     }
 
     public void clear() { lru.clear(); }

@@ -53,14 +53,26 @@ public class DnsServer {
         int threads = config.getInt("dns.workers", 16);
         this.workers = new ThreadPoolExecutor(threads, threads, 0, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(config.getInt("dns.queueSize", 1000)),
-                (task, pool) -> overloadDrops.incrementAndGet()); // reject = drop + count
+                (task, pool) -> {                                   // reject = drop + count
+                    overloadDrops.incrementAndGet();
+                    admission.stats().recordOverloadDrop();
+                });
     }
 
     /** Binds the socket and returns the bound port (useful with dns.port=0 in tests). */
     public int bind() throws SocketException {
         int port = config.getInt("dns.port", 5300);
-        String bind = config.get("dns.bind", "0.0.0.0").trim();
-        socket = new DatagramSocket(new InetSocketAddress(bind, port));
+        // "::" = IPv6 and IPv4 on one socket (Java sockets are dual-stack by default). Hosts and
+        // containers with IPv6 switched off can't bind it, so fall back to IPv4 only.
+        String bind = config.get("dns.bind", "::").trim();
+        try {
+            socket = new DatagramSocket(new InetSocketAddress(bind, port));
+        } catch (SocketException e) {
+            if (!bind.equals("::")) throw e;
+            System.err.println("IPv6 unavailable (" + e.getMessage() + "), UDP listening on IPv4 only");
+            bind = "0.0.0.0";
+            socket = new DatagramSocket(new InetSocketAddress(bind, port));
+        }
         System.out.println("DNS server listening on " + bind + ":" + socket.getLocalPort() + " (UDP), "
                 + admission.describe());
         return socket.getLocalPort();

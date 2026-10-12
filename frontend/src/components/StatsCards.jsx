@@ -9,12 +9,15 @@ export default function StatsCards({ stats }) {
   const cachedP50 = lat.CACHED?.p50
   const upstreamP50 = lat.FORWARDED?.p50
   const speedup = cachedP50 && upstreamP50 ? upstreamP50 / cachedP50 : null
+  // Queries the server shed on purpose under load: rate limits, full queue, upstream cap, TCP limits.
+  const shed = (stats.rateLimited || 0) + (stats.overloadDrops || 0) + (stats.upstreamBusy || 0) + (stats.tcpRefused || 0)
 
   const tiles = [
     {
       label: 'Total queries',
       value: compact(stats.totalQueries),
-      detail: `${full(stats.forwarded)} forwarded · ${full(stats.errors)} ${stats.errors === 1 ? 'error' : 'errors'}`,
+      detail: `${full(stats.forwarded)} forwarded · ${full(stats.errors)} ${stats.errors === 1 ? 'error' : 'errors'}`
+        + (shed ? ` · ${full(shed)} shed under load` : ''),
     },
     {
       label: 'Blocked',
@@ -34,7 +37,7 @@ export default function StatsCards({ stats }) {
     {
       label: 'Domains on blocklist',
       value: compact(stats.blocklistSize),
-      detail: `${full(stats.allowlistSize)} allowlisted${stats.rateLimited ? ` · ${full(stats.rateLimited)} rate-limited` : ''}`,
+      detail: `${full(stats.allowlistSize)} allowlisted`,
     },
   ]
   return (

@@ -11,6 +11,8 @@ import java.net.SocketTimeoutException;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -62,6 +64,68 @@ class UpstreamResolverTest {
             assertEquals(1, m.answers.size());
             assertEquals(1, up.tcpQueries.get());
             assertEquals(0, up.queries.get());
+        }
+    }
+
+    @Test
+    void servfailOrRefusedMovesOnToTheNextUpstream() throws Exception {
+        for (FakeUpstream.Mode broken : new FakeUpstream.Mode[]{FakeUpstream.Mode.SERVFAIL, FakeUpstream.Mode.REFUSED}) {
+            try (FakeUpstream bad = new FakeUpstream(); FakeUpstream good = new FakeUpstream()) {
+                bad.mode = broken;
+                UpstreamResolver r = new UpstreamResolver(List.of(bad.address(), good.address()), 500);
+                DnsMessage m = new DnsParser(r.forward(QUERY)).parse();
+                assertEquals(0, m.header.getRcode(), broken + " from the primary -> the fallback's answer");
+                assertEquals(1, m.answers.size());
+                assertEquals(good.address(), r.preferredUpstream());
+            }
+        }
+    }
+
+    @Test
+    void ifEveryUpstreamFailsTheErrorReplyIsReturnedNotATimeout() throws Exception {
+        try (FakeUpstream a = new FakeUpstream(); FakeUpstream b = new FakeUpstream()) {
+            a.mode = FakeUpstream.Mode.REFUSED;
+            b.mode = FakeUpstream.Mode.SILENT;
+            UpstreamResolver r = new UpstreamResolver(List.of(a.address(), b.address()), 200);
+            assertEquals(5, new DnsParser(r.forward(QUERY)).parse().header.getRcode(), "REFUSED, passed on");
+        }
+    }
+
+    @Test
+    void demotedPrimaryIsRetriedAfterTheInterval() throws Exception {
+        AtomicLong nanos = new AtomicLong(0);
+        try (FakeUpstream campus = new FakeUpstream(); FakeUpstream publicDns = new FakeUpstream()) {
+            campus.mode = FakeUpstream.Mode.SILENT;              // a blip
+            UpstreamResolver r = new UpstreamResolver(List.of(campus.address(), publicDns.address()), 200, 0,
+                    60, nanos::get);
+            r.forward(QUERY);
+            assertEquals(publicDns.address(), r.preferredUpstream());
+
+            campus.mode = FakeUpstream.Mode.NORMAL;              // campus is fine again
+            nanos.addAndGet(TimeUnit.SECONDS.toNanos(30));
+            r.forward(QUERY);
+            assertEquals(publicDns.address(), r.preferredUpstream(), "not yet: 30 s < 60 s");
+
+            nanos.addAndGet(TimeUnit.SECONDS.toNanos(31));
+            r.forward(QUERY);
+            assertEquals(campus.address(), r.preferredUpstream(), "after 60 s the primary is tried and wins back");
+        }
+    }
+
+    @Test
+    void stillDeadPrimaryCostsOneTimeoutPerInterval() throws Exception {
+        AtomicLong nanos = new AtomicLong(0);
+        try (FakeUpstream campus = new FakeUpstream(); FakeUpstream publicDns = new FakeUpstream()) {
+            campus.mode = FakeUpstream.Mode.SILENT;
+            UpstreamResolver r = new UpstreamResolver(List.of(campus.address(), publicDns.address()), 100, 0,
+                    60, nanos::get);
+            r.forward(QUERY);                                    // campus: 1 attempt
+            nanos.addAndGet(TimeUnit.SECONDS.toNanos(61));
+            r.forward(QUERY);                                    // retry: 2 attempts
+            r.forward(QUERY);
+            r.forward(QUERY);                                    // no more retries until another 60 s
+            assertEquals(2, campus.queries.get());
+            assertEquals(publicDns.address(), r.preferredUpstream());
         }
     }
 
