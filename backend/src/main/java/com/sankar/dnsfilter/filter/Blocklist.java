@@ -3,13 +3,17 @@ package com.sankar.dnsfilter.filter;
 import com.sankar.dnsfilter.config.Config;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -23,65 +27,112 @@ import java.util.concurrent.ConcurrentHashMap;
  * the blocklist. So allowing "ads.example.com" un-blocks just that subtree even though
  * "example.com" is blocked, and blocking "x.allowed.com" still works under an allowed parent.
  *
+ * Sources, applied in this order on every (re)load:
+ *   1. remote lists (downloaded, cached on disk)   2. local list files   3. allowlist file
+ *   4. overrides: the changes made through the API / dashboard (block, unblock, allow, unallow).
+ * The overrides are saved to blocklist.overridesFile on every change, so they survive a restart
+ * and a list refresh. Unblocking a domain that a list contains is remembered as "unblock", so it
+ * stays unblocked when the list is downloaded again.
+ *
+ * Reload: reload() builds complete new sets off to the side and swaps them in at once, so queries
+ * never see a half-loaded list. API edits made while a reload is running are replayed onto the
+ * new sets during the swap (both hold the same lock), so none are lost.
+ *
  * Stretch goal: replace with a reversed-label Trie (another DSA talking point).
  */
 public class Blocklist {
-    private final ConcurrentHashMap<String, String> blocked = new ConcurrentHashMap<>(); // domain -> category
-    private final Set<String> allowed = ConcurrentHashMap.newKeySet();
+    private volatile ConcurrentHashMap<String, String> blocked = new ConcurrentHashMap<>(); // domain -> category
+    private volatile Set<String> allowed = ConcurrentHashMap.newKeySet();
 
+    // Overrides from the API, guarded by `this`. Sorted so the saved file is stable and diffable.
+    private final Map<String, String> addedBlocks = new TreeMap<>();
+    private final Set<String> removedBlocks = new TreeSet<>();
+    private final Set<String> addedAllows = new TreeSet<>();
+    private final Set<String> removedAllows = new TreeSet<>();
+    private Path overridesFile;                         // null = keep overrides in memory only
+
+    private final Object reloadLock = new Object();     // one reload at a time
+
+    /** Reads the overrides file, then loads every list (using fresh cached downloads if any). */
     public void loadFromConfig(Config config) {
-        long start = System.currentTimeMillis();
-
-        // 1. Remote lists first (big, generic), so hand-curated local files can override categories.
-        for (RemoteBlocklist.Source src : RemoteBlocklist.parseSources(config.get("blocklist.remote", ""))) {
-            List<String> domains = RemoteBlocklist.fetch(src,
-                    Paths.get(config.get("blocklist.cacheDir", "../blocklists/downloaded")),
-                    config.getInt("blocklist.refreshHours", 24),
-                    config.getInt("blocklist.downloadTimeoutMs", 15000));
-            for (String d : domains) blocked.put(d, src.category);
+        String f = config.get("blocklist.overridesFile", "").trim();
+        if (!f.isEmpty()) {
+            overridesFile = Paths.get(f);
+            readOverrides();
         }
+        reload(config, false);
+    }
 
-        // 2. Local files: category = file name without extension (ads.txt -> "ads").
-        for (String f : splitList(config.get("blocklist.files", ""))) {
-            Path path = Paths.get(f);
-            String category = categoryFromFile(path);
-            try {
-                List<String> domains = BlocklistLoader.load(path);
-                for (String d : domains) blocked.put(d, category);
-                System.out.printf("Blocklist: %,d domains from %s [%s]%n", domains.size(), path, category);
-            } catch (IOException e) {
-                System.err.println("Blocklist: could not read " + path.toAbsolutePath() + " (" + e.getMessage() + ")");
+    /**
+     * Re-reads all sources and swaps them in atomically.
+     * @param forceDownload true = download remote lists even if the cached copy is still fresh
+     */
+    public void reload(Config config, boolean forceDownload) {
+        synchronized (reloadLock) {
+            long start = System.currentTimeMillis();
+            ConcurrentHashMap<String, String> newBlocked = new ConcurrentHashMap<>();
+            Set<String> newAllowed = ConcurrentHashMap.newKeySet();
+
+            // 1. Remote lists first (big, generic), so hand-curated local files can override categories.
+            for (RemoteBlocklist.Source src : RemoteBlocklist.parseSources(config.get("blocklist.remote", ""))) {
+                List<String> domains = RemoteBlocklist.fetch(src,
+                        Paths.get(config.get("blocklist.cacheDir", "../blocklists/downloaded")),
+                        forceDownload ? 0 : config.getInt("blocklist.refreshHours", 24),
+                        config.getInt("blocklist.downloadTimeoutMs", 15000));
+                for (String d : domains) newBlocked.put(d, src.category);
             }
-        }
 
-        // 3. Allowlist.
-        String allowFile = config.get("allowlist.file", "");
-        if (!allowFile.isBlank()) {
-            Path path = Paths.get(allowFile.trim());
-            if (Files.exists(path)) {
+            // 2. Local files: category = file name without extension (ads.txt -> "ads").
+            for (String f : splitList(config.get("blocklist.files", ""))) {
+                Path path = Paths.get(f);
+                String category = categoryFromFile(path);
                 try {
                     List<String> domains = BlocklistLoader.load(path);
-                    allowed.addAll(domains);
-                    System.out.printf("Allowlist: %,d domains from %s%n", domains.size(), path);
+                    for (String d : domains) newBlocked.put(d, category);
+                    System.out.printf("Blocklist: %,d domains from %s [%s]%n", domains.size(), path, category);
                 } catch (IOException e) {
-                    System.err.println("Allowlist: could not read " + path + " (" + e.getMessage() + ")");
+                    System.err.println("Blocklist: could not read " + path.toAbsolutePath() + " (" + e.getMessage() + ")");
                 }
             }
-        }
 
-        System.out.printf("Blocklist ready: %,d blocked, %,d allowed (%d ms) %s%n",
-                blocked.size(), allowed.size(), System.currentTimeMillis() - start, categoryCounts());
+            // 3. Allowlist file.
+            String allowFile = config.get("allowlist.file", "");
+            if (!allowFile.isBlank()) {
+                Path path = Paths.get(allowFile.trim());
+                if (Files.exists(path)) {
+                    try {
+                        List<String> domains = BlocklistLoader.load(path);
+                        newAllowed.addAll(domains);
+                        System.out.printf("Allowlist: %,d domains from %s%n", domains.size(), path);
+                    } catch (IOException e) {
+                        System.err.println("Allowlist: could not read " + path + " (" + e.getMessage() + ")");
+                    }
+                }
+            }
+
+            // 4. Overrides, then swap. Same lock as add/remove, so no API edit slips between the two.
+            synchronized (this) {
+                applyOverrides(newBlocked, newAllowed);
+                blocked = newBlocked;
+                allowed = newAllowed;
+            }
+            System.out.printf("Blocklist ready: %,d blocked, %,d allowed, %d override(s) (%d ms) %s%n",
+                    newBlocked.size(), newAllowed.size(), overrideCount(),
+                    System.currentTimeMillis() - start, categoryCounts());
+        }
     }
 
     /** @return category if blocked ("ads", "malware", ...), or null if the domain may resolve. */
     public String check(String domain) {
         if (domain == null || domain.isEmpty()) return null;
+        Map<String, String> b = blocked;   // one consistent snapshot for the whole walk
+        Set<String> a = allowed;
         String d = normalize(domain);
         // Most specific first: a.b.c.com, b.c.com, c.com. Stop before the bare TLD so a
         // stray "com" entry can never take down the whole internet.
         while (true) {
-            if (allowed.contains(d)) return null;
-            String category = blocked.get(d);
+            if (a.contains(d)) return null;
+            String category = b.get(d);
             if (category != null) return category;
             int dot = d.indexOf('.');
             if (dot < 0) return null;
@@ -91,14 +142,53 @@ public class Blocklist {
         }
     }
 
-    public void add(String domain, String category) { blocked.put(normalize(domain), category); }
-    public String remove(String domain) { return blocked.remove(normalize(domain)); }
-    public void allow(String domain) { allowed.add(normalize(domain)); }
-    public boolean unallow(String domain) { return allowed.remove(normalize(domain)); }
+    // ------------------------------------------------------------ API edits (persisted)
+
+    public synchronized void add(String domain, String category) {
+        String d = normalize(domain);
+        blocked.put(d, category);
+        addedBlocks.put(d, category);
+        removedBlocks.remove(d);
+        saveOverrides();
+    }
+
+    public synchronized String remove(String domain) {
+        String d = normalize(domain);
+        String category = blocked.remove(d);
+        if (category != null) {
+            addedBlocks.remove(d);
+            removedBlocks.add(d);       // keep it unblocked even if a list brings it back
+            saveOverrides();
+        }
+        return category;
+    }
+
+    public synchronized void allow(String domain) {
+        String d = normalize(domain);
+        allowed.add(d);
+        addedAllows.add(d);
+        removedAllows.remove(d);
+        saveOverrides();
+    }
+
+    public synchronized boolean unallow(String domain) {
+        String d = normalize(domain);
+        boolean removed = allowed.remove(d);
+        if (removed) {
+            addedAllows.remove(d);
+            removedAllows.add(d);
+            saveOverrides();
+        }
+        return removed;
+    }
+
     public boolean isListed(String domain) { return blocked.containsKey(normalize(domain)); }
     public int size() { return blocked.size(); }
     public int allowedSize() { return allowed.size(); }
     public Set<String> allowedDomains() { return Set.copyOf(allowed); }
+    public synchronized int overrideCount() {
+        return addedBlocks.size() + removedBlocks.size() + addedAllows.size() + removedAllows.size();
+    }
 
     /** Blocked-domain count per category, sorted by name - for the dashboard. */
     public Map<String, Integer> categoryCounts() {
@@ -106,6 +196,76 @@ public class Blocklist {
         for (String c : blocked.values()) counts.merge(c, 1, Integer::sum);
         return counts;
     }
+
+    // ------------------------------------------------------------ overrides file
+
+    private void applyOverrides(Map<String, String> b, Set<String> a) {
+        for (String d : removedBlocks) b.remove(d);
+        b.putAll(addedBlocks);
+        a.removeAll(removedAllows);
+        a.addAll(addedAllows);
+    }
+
+    /**
+     * File format, one change per line (lines starting with # are comments):
+     *   block ads tracker.example.com
+     *   unblock doubleclick.net
+     *   allow safe.example.com
+     *   unallow example.org
+     */
+    private synchronized void readOverrides() {
+        if (overridesFile == null || !Files.exists(overridesFile)) return;
+        try {
+            int lineNo = 0;
+            for (String raw : Files.readAllLines(overridesFile, StandardCharsets.UTF_8)) {
+                lineNo++;
+                String line = raw.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] t = line.split("\\s+");
+                String domain = BlocklistLoader.clean(t[t.length - 1]);
+                if (domain == null) {
+                    System.err.println("Overrides: skipping line " + lineNo + " (" + line + ")");
+                    continue;
+                }
+                switch (t[0]) {
+                    case "block":
+                        addedBlocks.put(domain, t.length == 3 ? t[1] : "custom");
+                        break;
+                    case "unblock": removedBlocks.add(domain); break;
+                    case "allow":   addedAllows.add(domain); break;
+                    case "unallow": removedAllows.add(domain); break;
+                    default: System.err.println("Overrides: unknown action on line " + lineNo + " (" + line + ")");
+                }
+            }
+            System.out.printf("Overrides: %d change(s) from %s%n", overrideCount(), overridesFile);
+        } catch (IOException e) {
+            System.err.println("Overrides: could not read " + overridesFile + " (" + e.getMessage() + ")");
+        }
+    }
+
+    /** Rewrites the whole file via a temp file + atomic move, so a crash never leaves half a file. */
+    private void saveOverrides() {
+        if (overridesFile == null) return;
+        List<String> lines = new ArrayList<>();
+        lines.add("# Blocklist changes made from the dashboard / API, applied on top of the list files.");
+        lines.add("# Rewritten by the server on every change. Edit by hand only while it is stopped.");
+        addedBlocks.forEach((d, c) -> lines.add("block " + c + " " + d));
+        removedBlocks.forEach(d -> lines.add("unblock " + d));
+        addedAllows.forEach(d -> lines.add("allow " + d));
+        removedAllows.forEach(d -> lines.add("unallow " + d));
+        try {
+            Path dir = overridesFile.toAbsolutePath().getParent();
+            Files.createDirectories(dir);
+            Path tmp = Files.createTempFile(dir, "overrides-", ".tmp");
+            Files.write(tmp, lines, StandardCharsets.UTF_8);
+            Files.move(tmp, overridesFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            System.err.println("Overrides: could not save " + overridesFile.toAbsolutePath()
+                    + " - this change is live but will be lost on restart (" + e.getMessage() + ")");
+        }
+    }
+
+    // ------------------------------------------------------------ helpers
 
     static String normalize(String d) {
         d = d.trim().toLowerCase();

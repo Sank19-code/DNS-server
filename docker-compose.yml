@@ -1,20 +1,29 @@
-# docker compose up --build    ->  dashboard on http://localhost:8081, DNS on UDP 5300
+# docker compose up --build    ->  dashboard on http://localhost:8081, DNS on port 5300 (UDP + TCP)
 services:
   dns-filter:
     build: .
     ports:
       - "5300:5300/udp"
-      - "8081:8081"
+      - "5300:5300/tcp"            # clients retry over TCP when an answer is too big for UDP
+      # The dashboard/API is published on this machine's loopback only. To reach it from other
+      # machines, set DNSFILTER_API_TOKEN, remove DNSFILTER_API_INSECURE below, and publish
+      # "8081:8081" (or better: put Caddy in front, see docs/DEPLOY.md).
+      - "127.0.0.1:8081:8081"
     environment:
-      # Set in a .env file next to this one (git-ignored) or your shell. Empty = dev mode.
+      # Set in a .env file next to this one (git-ignored) or your shell.
       DNSFILTER_API_TOKEN: ${DNSFILTER_API_TOKEN:-}
+      # Inside the container the API has to listen on 0.0.0.0, which is refused without a token
+      # unless api.insecure=true. That is only acceptable because port 8081 above is published on
+      # 127.0.0.1. It has no effect once a token is set.
+      DNSFILTER_API_INSECURE: ${DNSFILTER_API_INSECURE:-true}
       DNSFILTER_UPSTREAM_HOST: ${DNSFILTER_UPSTREAM_HOST:-1.1.1.1}
-      DNSFILTER_API_CORSORIGIN: ${DNSFILTER_API_CORSORIGIN:-*}
     volumes:
       - blocklist-cache:/app/blocklists/downloaded   # keep the downloaded list across restarts
+      - data:/app/data                               # dashboard edits to the lists + saved stats
     restart: unless-stopped
     # On a Linux server, `network_mode: host` (instead of ports:) lets the rate limiter see real
     # client IPs rather than Docker's NAT address.
 
 volumes:
   blocklist-cache: {}
+  data: {}

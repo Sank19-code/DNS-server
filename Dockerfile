@@ -26,14 +26,17 @@ WORKDIR /app/backend
 COPY --from=api /src/backend/target/dns-filter.jar ./dns-filter.jar
 COPY --from=ui /src/frontend/dist /app/frontend/dist
 COPY blocklists /app/blocklists
-RUN mkdir -p /app/blocklists/downloaded && chown -R dnsfilter /app/blocklists
+RUN mkdir -p /app/blocklists/downloaded /app/data && chown -R dnsfilter /app/blocklists /app/data
 USER dnsfilter
 
-# Public resolvers by default (the campus resolver in config.properties only works on campus).
+# The API must listen on all interfaces inside the container to be reachable through a published
+# port. Without DNSFILTER_API_TOKEN it then refuses to start unless DNSFILTER_API_INSECURE=true
+# (docker-compose.yml sets that and publishes 8081 on the host's loopback only).
 ENV DNSFILTER_UPSTREAM_HOST=1.1.1.1 \
     DNSFILTER_UPSTREAM_FALLBACK=8.8.8.8 \
     DNSFILTER_DNS_PORT=5300 \
-    DNSFILTER_API_PORT=8081
+    DNSFILTER_API_PORT=8081 \
+    DNSFILTER_API_BIND=0.0.0.0
 
-EXPOSE 5300/udp 8081/tcp
+EXPOSE 5300/udp 5300/tcp 8081/tcp
 CMD ["java", "-XX:MaxRAMPercentage=75", "-jar", "dns-filter.jar"]

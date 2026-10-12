@@ -1,4 +1,5 @@
-import { api } from './api/client.js'
+import { useEffect, useState } from 'react'
+import { api, AUTH_EVENT } from './api/client.js'
 import { usePoll } from './hooks/usePoll.js'
 import { uptime } from './lib/format.js'
 import StatsCards from './components/StatsCards.jsx'
@@ -8,13 +9,21 @@ import TopDomains from './components/TopDomains.jsx'
 import LatencyTable from './components/LatencyTable.jsx'
 import BlocklistManager from './components/BlocklistManager.jsx'
 import QueryLog from './components/QueryLog.jsx'
+import TokenPrompt from './components/TokenPrompt.jsx'
 
 export default function App() {
   const stats = usePoll(api.stats, 2000)
   const top = usePoll(() => api.top(8), 5000)
   const series = usePoll(api.timeseries, 5000)
   const s = stats.data
-  const down = Boolean(stats.error)
+  const [needToken, setNeedToken] = useState(false)
+  const down = Boolean(stats.error) && stats.error.status !== 401
+
+  useEffect(() => {
+    const onAuth = () => setNeedToken(true)
+    window.addEventListener(AUTH_EVENT, onAuth)
+    return () => window.removeEventListener(AUTH_EVENT, onAuth)
+  }, [])
 
   const refreshAll = () => { stats.refresh(); top.refresh(); series.refresh() }
 
@@ -29,10 +38,17 @@ export default function App() {
         {s && (
           <div className="meta muted">
             <span>Up {uptime(s.uptimeSeconds)}</span>
+            {s.countingSince < s.startedAt - 60_000 && (
+              <span title="Totals were restored from the saved stats file">
+                Counting since {new Date(s.countingSince).toLocaleDateString()}
+              </span>
+            )}
             <span>Upstream {s.upstreams?.join(', ')}</span>
           </div>
         )}
       </header>
+
+      {needToken && <TokenPrompt onSaved={() => { setNeedToken(false); refreshAll() }} />}
 
       <StatsCards stats={s} />
 

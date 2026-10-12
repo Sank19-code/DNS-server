@@ -146,3 +146,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 .result ul { margin: 6px 0 0; padding-left: 18px; }
 .result li { margin: 2px 0; word-break: break-all; }
 .msg { margin-top: 8px; font-size: 13px; color: var(--text-2); }
+
+/* ---------- token prompt ---------- */
+.token-prompt { margin-bottom: 12px; border-color: var(--accent); }
+.token-prompt .field-row { max-width: 480px; }

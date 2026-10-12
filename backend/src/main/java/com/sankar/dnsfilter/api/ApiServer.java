@@ -35,10 +35,12 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Pattern;
@@ -56,6 +58,7 @@ import java.util.regex.Pattern;
  *   GET    /api/blocklist?domain=x         is x blocked, and by which rule category
  *   POST   /api/blocklist   {domain, category}   *
  *   DELETE /api/blocklist?domain=x               *
+ *   POST   /api/blocklist/reload           re-download remote lists, re-read local files   *
  *   GET    /api/allowlist
  *   POST   /api/allowlist   {domain}             *
  *   DELETE /api/allowlist?domain=x               *
@@ -63,14 +66,26 @@ import java.util.regex.Pattern;
  *   DELETE /api/cache                      flush the cache                 *
  *   GET    /                               the built dashboard (frontend/dist), if present
  *
- *  * = mutating. If an admin token is configured (env DNSFILTER_API_TOKEN or api.token), these
- *      require "Authorization: Bearer <token>". Reads stay public so the dashboard demo works.
+ *  * = mutating.
  *
- * Errors are JSON: {"error": "..."} with a proper status (400, 401, 404, 405, 413, 429).
+ * Access control (the query log is the user's browsing history, and the lists decide what resolves):
+ *  - Admin token (env DNSFILTER_API_TOKEN or api.token): when set, every endpoint except /api/health
+ *    needs "Authorization: Bearer <token>". api.publicReads=true makes GETs public again (public demo).
+ *  - No token is only allowed while the API is bound to loopback (api.bind=127.0.0.1, the default).
+ *    Binding to another address without a token refuses to start, unless api.insecure=true.
+ *  - Cross-site requests: a mutating request whose Origin is neither this server nor api.corsOrigin
+ *    gets 403, and POST bodies must be application/json (so a plain HTML form can't send one).
+ *    Without this, any web page you visit could POST to http://localhost:8081/api/allowlist.
+ *  - DNS rebinding: without a token, the Host header must be an IP literal, localhost, or listed in
+ *    api.allowedHosts, so evil.example re-pointed at 127.0.0.1 can't read the API as "same origin".
+ *  - CORS headers are only sent for the single origin in api.corsOrigin. "*" is ignored without a token.
+ *
+ * Errors are JSON: {"error": "..."} with a proper status (400, 401, 403, 404, 405, 413, 415, 429).
  */
 public class ApiServer {
     private static final int MAX_BODY_BYTES = 4096;
     private static final Pattern CATEGORY = Pattern.compile("^[a-z0-9_-]{1,32}$");
+    private static final Pattern IPV4 = Pattern.compile("^\\d{1,3}(\\.\\d{1,3}){3}$");
 
     private final Config config;
     private final StatsCollector stats;
@@ -81,7 +96,11 @@ public class ApiServer {
     private final SecureRandom random = new SecureRandom();
     private final RateLimiter resolveLimiter;
     private final String adminToken;
-    private final String corsOrigin;
+    private final String corsOrigin;      // null = no CORS headers (same-origin only)
+    private final boolean publicReads;
+    private final boolean insecure;
+    private final Set<String> allowedHosts;
+    private Runnable reloadBlocklists = () -> { throw new ApiException(501, "blocklist reload not configured"); };
 
     private HttpServer server;
     private ExecutorService executor;
@@ -96,15 +115,39 @@ public class ApiServer {
         this.resolveLimiter = new RateLimiter(config.getInt("api.resolve.qps", 5), config.getInt("api.resolve.burst", 20));
         String token = config.get("api.token", ""); // env DNSFILTER_API_TOKEN overrides (see Config)
         this.adminToken = token.isBlank() ? null : token.trim();
-        this.corsOrigin = config.get("api.corsOrigin", "*").trim();
+        this.publicReads = Boolean.parseBoolean(config.get("api.publicReads", "false").trim());
+        this.insecure = Boolean.parseBoolean(config.get("api.insecure", "false").trim());
+        this.allowedHosts = new HashSet<>();
+        for (String h : config.get("api.allowedHosts", "").split(",")) {
+            if (!h.isBlank()) allowedHosts.add(h.trim().toLowerCase(Locale.ROOT));
+        }
+        String origin = config.get("api.corsOrigin", "").trim();
+        if (origin.endsWith("/")) origin = origin.substring(0, origin.length() - 1);
+        if (origin.equals("*") && adminToken == null) {
+            System.err.println("API: ignoring api.corsOrigin=* because no admin token is set "
+                    + "(any web page could read and change this server)");
+            origin = "";
+        }
+        this.corsOrigin = origin.isEmpty() ? null : origin;
     }
+
+    /** Wires POST /api/blocklist/reload (re-download remote lists, re-read local files). */
+    public void onReloadBlocklists(Runnable action) { this.reloadBlocklists = action; }
 
     /** Starts the server and returns the bound port (useful with api.port=0 in tests). */
     public int start() throws IOException {
-        String bind = config.get("api.bind", "0.0.0.0").trim();
+        String bind = config.get("api.bind", "127.0.0.1").trim();
         int port = config.getInt("api.port", 8081);
-        server = HttpServer.create(new InetSocketAddress(bind, port), 0);
-        executor = Executors.newFixedThreadPool(4);
+        InetSocketAddress address = new InetSocketAddress(bind, port);
+        if (adminToken == null && !address.getAddress().isLoopbackAddress() && !insecure) {
+            throw new IllegalStateException("Refusing to expose the API on " + bind + " without an admin token: "
+                    + "anyone who can reach it could read your query log and edit the blocklist. "
+                    + "Set DNSFILTER_API_TOKEN, or bind to 127.0.0.1, or set api.insecure=true if you really mean it.");
+        }
+        applyHttpServerLimits(config);
+        server = HttpServer.create(address, 0);
+        // Fixed pool; waiting exchanges are bounded by jdk.httpserver.maxConnections (one per connection).
+        executor = Executors.newFixedThreadPool(config.getInt("api.threads", 8));
         server.setExecutor(executor);
 
         route("/api/health", Map.of("GET", r -> Map.of("status", "ok")));
@@ -117,6 +160,11 @@ public class ApiServer {
                 "GET", this::getBlocklist,
                 "POST", this::addBlocked,
                 "DELETE", this::removeBlocked));
+        route("/api/blocklist/reload", Map.of("POST", r -> {
+            r.requireAdmin();
+            reloadBlocklists.run();
+            return getBlocklist(r);
+        }));
         route("/api/allowlist", Map.of(
                 "GET", r -> Map.of("size", blocklist.allowedSize(), "domains", sorted(blocklist.allowedDomains())),
                 "POST", this::addAllowed,
@@ -135,9 +183,36 @@ public class ApiServer {
         if (servingUi) System.out.println("Dashboard served from " + staticDir.toAbsolutePath().normalize()
                 + " at http://localhost:" + bound + "/");
         System.out.println("REST API listening on http://" + bind + ":" + bound + "/api"
-                + (adminToken == null ? " (no admin token: mutating endpoints are open - dev mode)"
-                                      : " (admin token required for POST/DELETE)"));
+                + (adminToken == null ? " (no admin token: open to this machine only - dev mode)"
+                   : publicReads ? " (admin token required for POST/DELETE; reads are public)"
+                   : " (admin token required)"));
+        if (adminToken == null && insecure && !address.getAddress().isLoopbackAddress()) {
+            System.err.println("WARNING: api.insecure=true - the API on " + bind + " has no token. "
+                    + "Anyone who can reach port " + bound + " can see every query and edit the lists.");
+        }
         return bound;
+    }
+
+    /**
+     * The JDK HttpServer has no limits by default: unlimited connections, and a client may take
+     * forever to send its headers (Slowloris). It reads these JVM properties once, when the first
+     * server is created, so they're set here unless already given with -D.
+     *   jdk.httpserver.maxConnections   api.maxConnections   [100]  extra connections are closed
+     *   sun.net.httpserver.maxReqTime   api.maxHeaderSec     [10]   seconds to send request headers
+     *   sun.net.httpserver.maxRspTime   api.maxResponseSec   [30]   seconds to read our response
+     *   sun.net.httpserver.idleInterval api.idleSec          [30]   keep-alive connections closed after
+     * The header timer stops before our handler runs, so a slow /api/blocklist/reload isn't cut off.
+     * Request bodies are only read after the token check, so an anonymous client can't drip-feed one.
+     */
+    static void applyHttpServerLimits(Config config) {
+        setIfAbsent("jdk.httpserver.maxConnections", config.getInt("api.maxConnections", 100));
+        setIfAbsent("sun.net.httpserver.maxReqTime", config.getInt("api.maxHeaderSec", 10));
+        setIfAbsent("sun.net.httpserver.maxRspTime", config.getInt("api.maxResponseSec", 30));
+        setIfAbsent("sun.net.httpserver.idleInterval", config.getInt("api.idleSec", 30));
+    }
+
+    private static void setIfAbsent(String property, int value) {
+        if (System.getProperty(property) == null) System.setProperty(property, String.valueOf(value));
     }
 
     public void stop() {
@@ -156,6 +231,7 @@ public class ApiServer {
         b.put("forwarded", stats.forwarded());
         b.put("errors", stats.errors());
         b.put("rateLimited", stats.rateLimited());
+        b.put("upstreamBusy", handler.upstreamBusy());
         b.put("blockedPercent", percent(stats.blocked(), total));
         b.put("blocklistSize", blocklist.size());
         b.put("allowlistSize", blocklist.allowedSize());
@@ -168,6 +244,7 @@ public class ApiServer {
         b.put("latencyMs", stats.latency());
         b.put("uptimeSeconds", stats.uptimeSeconds());
         b.put("startedAt", stats.startedAt());
+        b.put("countingSince", stats.countingSince());
         b.put("upstreams", handler.upstream().upstreams().stream().map(a -> a.getHostString() + ":" + a.getPort()).toList());
         return b;
     }
@@ -274,6 +351,7 @@ public class ApiServer {
         b.put("size", blocklist.size());
         b.put("categories", blocklist.categoryCounts());
         b.put("allowlistSize", blocklist.allowedSize());
+        b.put("overrides", blocklist.overrideCount());
         return b;
     }
 
@@ -382,6 +460,12 @@ public class ApiServer {
         }
 
         JsonObject jsonBody() {
+            // A cross-site <form> or a "simple" fetch can only send text/plain, form-urlencoded or
+            // multipart without a CORS preflight. Requiring JSON forces the preflight, which we refuse.
+            String type = ex.getRequestHeaders().getFirst("Content-Type");
+            if (type == null || !type.trim().toLowerCase(Locale.ROOT).startsWith("application/json")) {
+                throw new ApiException(415, "Content-Type must be application/json");
+            }
             String body;
             try (InputStream in = ex.getRequestBody()) {
                 byte[] bytes = in.readNBytes(MAX_BODY_BYTES + 1);
@@ -399,15 +483,65 @@ public class ApiServer {
             }
         }
 
-        /** Constant-time token comparison so the token can't be guessed byte by byte from timing. */
-        void requireAdmin() {
-            if (adminToken == null) return;
-            String auth = ex.getRequestHeaders().getFirst("Authorization");
-            String given = auth != null && auth.startsWith("Bearer ") ? auth.substring(7).trim() : "";
-            if (!MessageDigest.isEqual(given.getBytes(StandardCharsets.UTF_8), adminToken.getBytes(StandardCharsets.UTF_8))) {
-                throw new ApiException(401, "admin token required");
-            }
+        void requireAdmin() { checkToken(ex); }
+    }
+
+    /** Constant-time token comparison so the token can't be guessed byte by byte from timing. */
+    private void checkToken(HttpExchange ex) {
+        if (adminToken == null) return;
+        String auth = ex.getRequestHeaders().getFirst("Authorization");
+        String given = auth != null && auth.startsWith("Bearer ") ? auth.substring(7).trim() : "";
+        if (!MessageDigest.isEqual(given.getBytes(StandardCharsets.UTF_8), adminToken.getBytes(StandardCharsets.UTF_8))) {
+            throw new ApiException(401, "admin token required");
         }
+    }
+
+    /**
+     * Rejects requests a browser was tricked into sending (see the class comment):
+     *  - without a token, the Host must be an IP literal, localhost or in api.allowedHosts (DNS rebinding)
+     *  - a mutating request may only come from our own origin or the configured api.corsOrigin (CSRF)
+     */
+    private void checkBrowserRequest(HttpExchange ex) {
+        String host = ex.getRequestHeaders().getFirst("Host");
+        if (adminToken == null && !trustedHost(host)) {
+            throw new ApiException(403, "unexpected Host header; add it to api.allowedHosts or set an admin token");
+        }
+        String method = ex.getRequestMethod();
+        if (method.equals("GET") || method.equals("HEAD")) return;
+        String origin = ex.getRequestHeaders().getFirst("Origin");
+        if (origin == null) return;                       // not a browser (curl, scripts, tests)
+        if (!allowedOrigin(origin, host)) throw new ApiException(403, "cross-origin request refused");
+    }
+
+    private boolean allowedOrigin(String origin, String host) {
+        if (corsOrigin != null && (corsOrigin.equals("*") || corsOrigin.equalsIgnoreCase(origin))) return true;
+        try {
+            java.net.URI u = new java.net.URI(origin);
+            if (u.getHost() == null) return false;        // "null" origin: sandboxed frame, file://
+            String authority = u.getHost() + (u.getPort() >= 0 ? ":" + u.getPort() : "");
+            if (host != null && authority.equalsIgnoreCase(host.trim())) return true; // same origin
+            // Dev mode: the Vite dev server on another localhost port talks to us directly.
+            return adminToken == null && isLoopbackName(u.getHost());
+        } catch (java.net.URISyntaxException e) {
+            return false;
+        }
+    }
+
+    private boolean trustedHost(String hostHeader) {
+        if (hostHeader == null || hostHeader.isBlank()) return true;   // HTTP/1.0 client, not a browser
+        String h = hostHeader.trim().toLowerCase(Locale.ROOT);
+        if (h.startsWith("[")) return true;                            // [IPv6]:port literal
+        int colon = h.lastIndexOf(':');
+        if (colon >= 0) h = h.substring(0, colon);
+        return IPV4.matcher(h).matches() || isLoopbackName(h) || allowedHosts.contains(h);
+    }
+
+    private static boolean isLoopbackName(String host) {
+        String h = host.toLowerCase(Locale.ROOT);
+        if (h.startsWith("[") && h.endsWith("]")) h = h.substring(1, h.length() - 1);
+        // "127.evil.com" is a hostname an attacker controls, so 127.x must be a real IP literal.
+        return h.equals("localhost") || h.endsWith(".localhost") || h.equals("::1")
+                || (h.startsWith("127.") && IPV4.matcher(h).matches());
     }
 
     private void route(String path, Map<String, Handler> handlers) {
@@ -419,15 +553,20 @@ public class ApiServer {
                     return;
                 }
                 if ("OPTIONS".equals(ex.getRequestMethod())) {     // CORS preflight
-                    addCors(ex);
+                    addCors(ex);   // no headers unless api.corsOrigin is set -> the browser gives up
                     ex.sendResponseHeaders(204, -1);
                     return;
                 }
+                checkBrowserRequest(ex);
                 Handler h = handlers.get(ex.getRequestMethod());
                 if (h == null) {
                     ex.getResponseHeaders().add("Allow", String.join(", ", handlers.keySet()));
                     send(ex, 405, Map.of("error", "method not allowed"));
                     return;
+                }
+                // Reads need the token too (the query log is browsing history), unless publicReads.
+                if (!path.equals("/api/health") && !(publicReads && ex.getRequestMethod().equals("GET"))) {
+                    checkToken(ex);
                 }
                 Object result = h.handle(new Request(ex));
                 if (result instanceof Reply rep) send(ex, rep.status, rep.body);
@@ -454,7 +593,9 @@ public class ApiServer {
     }
 
     private void addCors(HttpExchange ex) {
+        if (corsOrigin == null) return;
         ex.getResponseHeaders().set("Access-Control-Allow-Origin", corsOrigin);
+        ex.getResponseHeaders().set("Vary", "Origin");
         ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Authorization");
     }

@@ -32,6 +32,7 @@ public class StatsCollector {
 
     private final LongSupplier clock;
     private final long startedAt;
+    private volatile long countingSince;   // earlier than startedAt once a saved snapshot is restored
 
     private final LongAdder total = new LongAdder();
     private final EnumMap<QueryLogEntry.Status, LongAdder> byStatus = new EnumMap<>(QueryLogEntry.Status.class);
@@ -53,6 +54,7 @@ public class StatsCollector {
     public StatsCollector(LongSupplier clock) {
         this.clock = clock;
         this.startedAt = clock.getAsLong();
+        this.countingSince = startedAt;
         this.perMinute = new TimeSeries(60, clock);
         for (QueryLogEntry.Status s : QueryLogEntry.Status.values()) byStatus.put(s, new LongAdder());
     }
@@ -68,6 +70,10 @@ public class StatsCollector {
             bump(domainCounts, e.domain);
         }
         perMinute.record(e.status);
+        append(e);
+    }
+
+    private void append(QueryLogEntry e) {
         synchronized (ring) {
             ring[ringPos] = e;
             ringPos = (ringPos + 1) % LOG_SIZE;
@@ -96,6 +102,8 @@ public class StatsCollector {
     public long rateLimited() { return rateLimited.sum(); }
     public long uptimeSeconds() { return (clock.getAsLong() - startedAt) / 1000; }
     public long startedAt() { return startedAt; }
+    /** When the totals started counting: this process's start, or the first run of a restored snapshot. */
+    public long countingSince() { return countingSince; }
 
     public List<DomainCount> topDomains(int n) { return topN(domainCounts, n); }
     public List<DomainCount> topBlocked(int n) { return topN(blockedCounts, n); }
@@ -156,6 +164,83 @@ public class StatsCollector {
         List<DomainCount> out = new ArrayList<>(heap);
         out.sort(heap.comparator().reversed()); // largest first
         return out;
+    }
+
+    // ---------------------------------------------------------------- save / restore
+
+    /**
+     * Everything worth keeping across a restart, as plain data for JSON (see StatsStore).
+     * The per-minute series is left out: it describes the last hour, which a restart interrupts.
+     */
+    public static final class Snapshot {
+        public int version = 1;
+        public long countingSince;
+        public long savedAt;
+        public Map<String, Long> byStatus;
+        public long rateLimited;
+        public Map<String, Long> domains;
+        public Map<String, Long> blocked;
+        public Map<String, Long> clients;
+        public Map<String, Long> categories;
+        public List<QueryLogEntry> recent;     // oldest first
+    }
+
+    public Snapshot snapshot() {
+        Snapshot s = new Snapshot();
+        s.countingSince = countingSince;
+        s.savedAt = clock.getAsLong();
+        s.byStatus = new LinkedHashMap<>();
+        for (Map.Entry<QueryLogEntry.Status, LongAdder> e : byStatus.entrySet()) s.byStatus.put(e.getKey().name(), e.getValue().sum());
+        s.rateLimited = rateLimited.sum();
+        s.domains = sums(domainCounts);
+        s.blocked = sums(blockedCounts);
+        s.clients = sums(clientCounts);
+        s.categories = sums(categoryCounts);
+        List<QueryLogEntry> recent = new ArrayList<>(recent(LOG_SIZE));
+        Collections.reverse(recent);
+        s.recent = recent;
+        return s;
+    }
+
+    /** Adds a saved snapshot's counts to this collector (call once, at startup). */
+    public void restore(Snapshot s) {
+        if (s.byStatus != null) {
+            for (Map.Entry<String, Long> e : s.byStatus.entrySet()) {
+                QueryLogEntry.Status status;
+                try { status = QueryLogEntry.Status.valueOf(e.getKey()); } catch (IllegalArgumentException x) { continue; }
+                long n = e.getValue() == null ? 0 : e.getValue();
+                byStatus.get(status).add(n);
+                total.add(n);
+            }
+        }
+        rateLimited.add(s.rateLimited);
+        addAll(domainCounts, s.domains);
+        addAll(blockedCounts, s.blocked);
+        addAll(clientCounts, s.clients);
+        addAll(categoryCounts, s.categories);
+        if (s.recent != null) {
+            for (QueryLogEntry e : s.recent) if (e != null && e.status != null && e.domain != null) append(e);
+        }
+        if (s.countingSince > 0 && s.countingSince < countingSince) countingSince = s.countingSince;
+    }
+
+    private static Map<String, Long> sums(Map<String, LongAdder> m) {
+        Map<String, Long> out = new LinkedHashMap<>();
+        for (Map.Entry<String, LongAdder> e : m.entrySet()) out.put(e.getKey(), e.getValue().sum());
+        return out;
+    }
+
+    private static void addAll(Map<String, LongAdder> into, Map<String, Long> from) {
+        if (from == null) return;
+        for (Map.Entry<String, Long> e : from.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null) continue;
+            LongAdder a = into.get(e.getKey());
+            if (a == null) {
+                if (into.size() >= MAX_TRACKED) continue;
+                a = into.computeIfAbsent(e.getKey(), k -> new LongAdder());
+            }
+            a.add(e.getValue());
+        }
     }
 
     private static void bump(Map<String, LongAdder> map, String key) {

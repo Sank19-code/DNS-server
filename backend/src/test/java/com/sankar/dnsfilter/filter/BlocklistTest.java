@@ -106,6 +106,65 @@ class BlocklistTest {
     }
 
     @Test
+    void apiEditsAreSavedAndSurviveRestartAndReload() throws Exception {
+        Path dir = Files.createTempDirectory("bl");
+        Path ads = Files.writeString(dir.resolve("ads.txt"), "doubleclick.net\nadnxs.com\n");
+        Path allow = Files.writeString(dir.resolve("allowlist.txt"), "good.adnxs.com\n");
+        Path overrides = dir.resolve("data/overrides.txt");
+        Path cfgFile = Files.writeString(dir.resolve("test.properties"),
+                "blocklist.files=" + slash(ads) + "\nallowlist.file=" + slash(allow) + "\nblocklist.remote=\n"
+                        + "blocklist.overridesFile=" + slash(overrides) + "\n");
+        Config config = Config.load(cfgFile.toString());
+
+        Blocklist first = new Blocklist();
+        first.loadFromConfig(config);
+        first.add("tracker.example.org", "trackers");
+        first.remove("doubleclick.net");                 // listed in ads.txt
+        first.allow("safe.example.org");
+        first.unallow("good.adnxs.com");                 // listed in allowlist.txt
+        assertTrue(Files.exists(overrides), "saved on change, parent directory created");
+
+        Blocklist restarted = new Blocklist();
+        restarted.loadFromConfig(config);
+        assertEquals("trackers", restarted.check("x.tracker.example.org"));
+        assertNull(restarted.check("ad.doubleclick.net"), "the list still has it, the unblock wins");
+        assertTrue(restarted.allowedDomains().contains("safe.example.org"));
+        assertEquals("ads", restarted.check("good.adnxs.com"), "un-allowed, so the parent block applies");
+        assertEquals(4, restarted.overrideCount());
+
+        // a list refresh brings doubleclick.net back from the file, but the unblock is re-applied
+        Files.writeString(ads, "doubleclick.net\nadnxs.com\nnew-ad.com\n");
+        restarted.reload(config, false);
+        assertEquals("ads", restarted.check("new-ad.com"));
+        assertNull(restarted.check("doubleclick.net"));
+        assertEquals("trackers", restarted.check("tracker.example.org"));
+
+        // re-blocking clears the unblock
+        restarted.add("doubleclick.net", "ads");
+        Blocklist third = new Blocklist();
+        third.loadFromConfig(config);
+        assertEquals("ads", third.check("doubleclick.net"));
+    }
+
+    @Test
+    void reloadSwapsInNewListsWithoutLosingApiEdits() throws Exception {
+        Path dir = Files.createTempDirectory("bl");
+        Path ads = Files.writeString(dir.resolve("ads.txt"), "old-ad.com\n");
+        Path cfgFile = Files.writeString(dir.resolve("test.properties"),
+                "blocklist.files=" + slash(ads) + "\nblocklist.remote=\n");
+        Config config = Config.load(cfgFile.toString());
+        Blocklist b = new Blocklist();
+        b.loadFromConfig(config);
+        b.add("manual.com", "custom");                   // in-memory override (no overrides file)
+
+        Files.writeString(ads, "new-ad.com\n");
+        b.reload(config, false);
+        assertNull(b.check("old-ad.com"), "removed from the file -> gone after reload");
+        assertEquals("ads", b.check("new-ad.com"));
+        assertEquals("custom", b.check("manual.com"));
+    }
+
+    @Test
     void remoteSourcesParse() {
         List<RemoteBlocklist.Source> s = RemoteBlocklist.parseSources("ads|https://a/hosts, https://b/list");
         assertEquals(2, s.size());

@@ -1,16 +1,22 @@
 import { useState } from 'react'
-import { api, getToken, setToken } from '../api/client.js'
+import { api } from '../api/client.js'
 
 const CATEGORIES = ['custom', 'ads', 'trackers', 'malware']
 
 // Add / remove / allow / check a domain at runtime. Changes apply instantly - the blocklist is
-// checked before the cache, so no restart and no stale cached answers.
+// checked before the cache, so no restart and no stale cached answers - and are saved to the
+// server's overrides file, so they survive a restart.
 export default function BlocklistManager({ stats, onChange }) {
   const [domain, setDomain] = useState('')
   const [category, setCategory] = useState('custom')
   const [msg, setMsg] = useState(null)
-  const [needToken, setNeedToken] = useState(false)
-  const [token, setTokenInput] = useState(getToken())
+  const [busy, setBusy] = useState(false)
+
+  const report = (e) => setMsg({
+    ok: false,
+    // a 401 also opens the token prompt at the top of the page (see App)
+    text: e.status === 401 ? 'This server requires an admin token for changes.' : e.message,
+  })
 
   const run = async (label, fn) => {
     const d = domain.trim()
@@ -20,12 +26,19 @@ export default function BlocklistManager({ stats, onChange }) {
       setMsg({ ok: true, text: label(res, d) })
       onChange?.()
     } catch (e) {
-      if (e.status === 401) {
-        setNeedToken(true)
-        setMsg({ ok: false, text: 'This server requires an admin token for changes.' })
-      } else {
-        setMsg({ ok: false, text: e.message })
-      }
+      report(e)
+    }
+  }
+
+  const action = async (fn, label) => {
+    setBusy(true)
+    try {
+      setMsg({ ok: true, text: label(await fn()) })
+      onChange?.()
+    } catch (e) {
+      report(e)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -56,19 +69,14 @@ export default function BlocklistManager({ stats, onChange }) {
       </div>
       {msg && <p className={msg.ok ? 'msg' : 'error-text'} role="status">{msg.text}</p>}
 
-      {needToken && (
-        <form className="field-row" style={{ marginTop: 8 }}
-              onSubmit={(e) => { e.preventDefault(); setToken(token.trim()); setNeedToken(false); setMsg({ ok: true, text: 'Token saved in this browser. Try again.' }) }}>
-          <input type="password" value={token} onChange={(e) => setTokenInput(e.target.value)} placeholder="Admin token" aria-label="Admin token" />
-          <button type="submit">Save</button>
-        </form>
-      )}
-
       <div className="btn-row" style={{ marginTop: 16 }}>
-        <button onClick={async () => {
-          try { const r = await api.flushCache(); setMsg({ ok: true, text: `Cache flushed (${r.flushed} entries)` }); onChange?.() }
-          catch (e) { if (e.status === 401) setNeedToken(true); setMsg({ ok: false, text: e.message }) }
-        }}>Flush DNS cache</button>
+        <button disabled={busy} onClick={() => action(api.flushCache, (r) => `Cache flushed (${r.flushed} entries)`)}>
+          Flush DNS cache
+        </button>
+        <button disabled={busy} onClick={() => action(api.reloadBlocklists,
+          (r) => `Lists reloaded: ${r.size.toLocaleString()} blocked domains`)}>
+          {busy ? 'Working…' : 'Reload lists'}
+        </button>
       </div>
     </section>
   )

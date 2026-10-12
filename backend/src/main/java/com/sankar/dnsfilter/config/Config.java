@@ -3,6 +3,9 @@ package com.sankar.dnsfilter.config;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
@@ -15,22 +18,36 @@ import java.util.Properties;
  *        upstream.host  ->  DNSFILTER_UPSTREAM_HOST=1.1.1.1
  *        api.token      ->  DNSFILTER_API_TOKEN=...      (keep secrets out of files)
  *   2. JVM system property   -Dupstream.host=1.1.1.1
- *   3. the properties file
+ *   3. config.local.properties in the working directory (git-ignored: your machine's settings,
+ *      e.g. a campus resolver), only when no explicit file path is given
+ *   4. the properties file
  */
 public class Config {
+    public static final String LOCAL_FILE = "config.local.properties";
+
     private final Properties props = new Properties();
     private final Map<String, String> env;
 
     Config(Map<String, String> env) { this.env = env; }
 
     public static Config load(String path) throws IOException {
+        return load(path, Paths.get(LOCAL_FILE));
+    }
+
+    static Config load(String path, Path localOverrides) throws IOException {
         Config c = new Config(System.getenv());
         if (path != null) {
             try (InputStream in = new FileInputStream(path)) { c.props.load(in); }
-        } else {
-            try (InputStream in = Config.class.getResourceAsStream("/config.properties")) {
-                if (in != null) c.props.load(in);
-            }
+            return c;
+        }
+        try (InputStream in = Config.class.getResourceAsStream("/config.properties")) {
+            if (in != null) c.props.load(in);
+        }
+        if (localOverrides != null && Files.isRegularFile(localOverrides)) {
+            Properties local = new Properties();
+            try (InputStream in = Files.newInputStream(localOverrides)) { local.load(in); }
+            c.props.putAll(local);
+            System.out.println("Config: " + local.size() + " setting(s) from " + localOverrides.toAbsolutePath());
         }
         return c;
     }

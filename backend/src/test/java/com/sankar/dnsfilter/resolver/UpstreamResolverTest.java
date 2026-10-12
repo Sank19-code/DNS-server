@@ -8,7 +8,9 @@ import com.sankar.dnsfilter.protocol.DnsWriter;
 import org.junit.jupiter.api.Test;
 
 import java.net.SocketTimeoutException;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -24,6 +26,42 @@ class UpstreamResolverTest {
             DnsMessage m = new DnsParser(r.forward(QUERY)).parse();
             assertEquals(0x4242, m.header.id);
             assertEquals("0.0.0.0", m.answers.get(0).toString().split(" ")[3], "spoofed 0.0.0.66 must be ignored");
+        }
+    }
+
+    @Test
+    void usesItsOwnRandomIdUpstreamAndRestoresTheClients() throws Exception {
+        try (FakeUpstream up = new FakeUpstream()) {
+            UpstreamResolver r = new UpstreamResolver(List.of(up.address()), 1000);
+            Set<Integer> idsSeenUpstream = new HashSet<>();
+            for (int i = 0; i < 5; i++) {
+                assertEquals(0x4242, new DnsParser(r.forward(QUERY)).parse().header.id);
+                idsSeenUpstream.add(up.lastId);
+            }
+            assertNotEquals(Set.of(0x4242), idsSeenUpstream, "the client's ID must not be what goes upstream");
+        }
+    }
+
+    @Test
+    void ignoresReplyForADifferentQuestion() throws Exception {
+        try (FakeUpstream up = new FakeUpstream()) {
+            up.mode = FakeUpstream.Mode.WRONG_QUESTION_FIRST;
+            UpstreamResolver r = new UpstreamResolver(List.of(up.address()), 1000);
+            DnsMessage m = new DnsParser(r.forward(QUERY)).parse();
+            assertEquals("example.com", m.questions.get(0).name);
+            assertEquals("0.0.0.0", m.answers.get(0).data(), "the right-ID-wrong-question reply must be ignored");
+        }
+    }
+
+    @Test
+    void forwardsOverTcp() throws Exception {
+        try (FakeUpstream up = new FakeUpstream()) {
+            UpstreamResolver r = new UpstreamResolver(List.of(up.address()), 1000);
+            DnsMessage m = new DnsParser(r.forwardTcp(QUERY)).parse();
+            assertEquals(0x4242, m.header.id);
+            assertEquals(1, m.answers.size());
+            assertEquals(1, up.tcpQueries.get());
+            assertEquals(0, up.queries.get());
         }
     }
 

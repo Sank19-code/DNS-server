@@ -42,13 +42,40 @@ class RateLimiterTest {
     }
 
     @Test
-    void idleBucketsAreSwept() {
-        RateLimiter rl = new RateLimiter(10, 10, now::get);
+    void remembersAtMostMaxClientsLeastRecentlySeenFirst() {
+        RateLimiter rl = new RateLimiter(1, 1, 3, now::get);
         rl.tryAcquire("a");
         rl.tryAcquire("b");
-        now.addAndGet(61_000);
         rl.tryAcquire("c");
-        rl.sweep(now.get());
-        assertEquals(1, rl.trackedClients());
+        assertFalse(rl.tryAcquire("a"), "a is still limited (and now the most recently seen)");
+        rl.tryAcquire("d");                                  // evicts b, the least recently seen
+        assertEquals(3, rl.trackedClients());
+        assertEquals(1, rl.evictions());
+        assertFalse(rl.tryAcquire("a"), "an active flooder keeps its empty bucket");
+        assertTrue(rl.tryAcquire("b"), "b was forgotten, so it starts with a fresh bucket");
+    }
+
+    @Test
+    void spoofedSourceFloodStaysBoundedAndCheap() {
+        RateLimiter rl = new RateLimiter(50, 100, 1_000, now::get);
+        long start = System.nanoTime();
+        for (int i = 0; i < 1_000_000; i++) {               // a million different fake addresses
+            rl.tryAcquire("10." + (i >> 16 & 255) + "." + (i >> 8 & 255) + "." + (i & 255));
+        }
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        assertEquals(1_000, rl.trackedClients(), "memory stays at maxClients");
+        assertTrue(ms < 5_000, "constant work per packet, not a scan of the whole map: took " + ms + " ms");
+    }
+
+    @Test
+    void globalLimiterCapsEveryoneTogether() {
+        RateLimiter global = RateLimiter.global(100, 10, now::get);
+        int allowed = 0;
+        for (int i = 0; i < 50; i++) if (global.tryAcquire()) allowed++;
+        assertEquals(10, allowed, "burst of 10 shared by all clients");
+        now.addAndGet(100);                                  // 100 ms at 100/s -> 10 more
+        allowed = 0;
+        for (int i = 0; i < 50; i++) if (global.tryAcquire()) allowed++;
+        assertEquals(10, allowed);
     }
 }

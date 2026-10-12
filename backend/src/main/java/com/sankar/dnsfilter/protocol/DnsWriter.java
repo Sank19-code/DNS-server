@@ -155,7 +155,97 @@ public class DnsWriter {
         return out;
     }
 
+    /**
+     * True if the reply's question section is the query's (names compared case-insensitively, so
+     * DNS 0x20 case randomisation is fine; type and class must match exactly). Error replies are
+     * allowed to omit the question entirely, as some servers do for FORMERR / REFUSED.
+     */
+    public static boolean sameQuestion(byte[] query, byte[] reply) {
+        try {
+            int qd = readU16(query, 4);
+            int rd = readU16(reply, 4);
+            if (rd == 0) return (reply[3] & DnsHeader.MASK_RCODE) != DnsHeader.RCODE_NOERROR;
+            if (qd != rd) return false;
+            int q = DnsHeader.SIZE, r = DnsHeader.SIZE;
+            for (int i = 0; i < qd; i++) {
+                while (true) {                                  // labels, uncompressed in a question
+                    int len = query[q] & 0xFF;
+                    if (len != (reply[r] & 0xFF) || (len & 0xC0) != 0) return false;
+                    q++; r++;
+                    if (len == 0) break;
+                    for (int k = 0; k < len; k++, q++, r++) {
+                        if (asciiLower(query[q]) != asciiLower(reply[r])) return false;
+                    }
+                }
+                for (int k = 0; k < 4; k++, q++, r++) {          // QTYPE + QCLASS
+                    if (query[q] != reply[r]) return false;
+                }
+            }
+            return true;
+        } catch (ArrayIndexOutOfBoundsException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Reply for when the real answer doesn't fit the client's UDP limit: header + question, TC=1,
+     * no records. The client is expected to retry over TCP (RFC 1035 section 4.2.1, RFC 7766).
+     */
+    public static byte[] buildTruncatedResponse(byte[] query, int queryLength, int rcode) {
+        byte[] out = buildErrorResponse(query, queryLength, rcode);
+        out[2] |= (byte) (DnsHeader.FLAG_TC >> 8);
+        return out;
+    }
+
+    /** EDNS(0) info from a query's OPT record (RFC 6891). */
+    public static final class Edns {
+        public static final Edns NONE = new Edns(false, 512, false);
+        public final boolean present;
+        /** Largest UDP reply the client accepts: 512 without EDNS, never below 512 with it. */
+        public final int udpSize;
+        /** DO bit: the client wants DNSSEC records. */
+        public final boolean dnssecOk;
+
+        Edns(boolean present, int udpSize, boolean dnssecOk) {
+            this.present = present; this.udpSize = udpSize; this.dnssecOk = dnssecOk;
+        }
+    }
+
+    /** Finds the OPT pseudo-record in the additional section. Malformed or absent -> Edns.NONE. */
+    public static Edns edns(byte[] msg, int length) {
+        try {
+            if (length < DnsHeader.SIZE) return Edns.NONE;
+            int qd = readU16(msg, 4);
+            int rr = readU16(msg, 6) + readU16(msg, 8);
+            int ar = readU16(msg, 10);
+            int pos = DnsHeader.SIZE;
+            for (int i = 0; i < qd; i++) pos = skipName(msg, pos) + 4;
+            for (int i = 0; i < rr; i++) {
+                int p = skipName(msg, pos);
+                pos = p + 10 + readU16(msg, p + 8);
+            }
+            for (int i = 0; i < ar; i++) {
+                int p = skipName(msg, pos);
+                if (p + 10 > length) return Edns.NONE;
+                if (readU16(msg, p) == DnsQuestion.TYPE_OPT) {
+                    int size = Math.max(512, readU16(msg, p + 2));         // CLASS field = UDP size
+                    boolean dnssecOk = (msg[p + 6] & 0x80) != 0;           // TTL field: ext-rcode, version, DO|Z
+                    return new Edns(true, size, dnssecOk);
+                }
+                pos = p + 10 + readU16(msg, p + 8);
+            }
+        } catch (ArrayIndexOutOfBoundsException ignored) {
+            // fall through: treat as a plain (non-EDNS) query
+        }
+        return Edns.NONE;
+    }
+
     // ---------------------------------------------------------------- helpers
+
+    private static int asciiLower(byte b) {
+        int c = b & 0xFF;
+        return c >= 'A' && c <= 'Z' ? c + 32 : c;
+    }
 
     /** Position just past a (possibly compressed) domain name starting at pos. */
     static int skipName(byte[] b, int pos) {

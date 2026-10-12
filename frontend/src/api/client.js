@@ -1,9 +1,10 @@
 // Thin wrapper around the Java REST API (proxied by Vite in dev).
 const BASE = '/api'
 
-// Optional admin token for POST/DELETE when the backend sets DNSFILTER_API_TOKEN.
-// Stored per browser; the dashboard can prompt for it on a 401.
+// Admin token, needed for every call except /health when the backend sets DNSFILTER_API_TOKEN.
+// Stored per browser. Any 401 fires AUTH_EVENT so the app can ask for it once, in one place.
 const TOKEN_KEY = 'dnsfilter.token'
+export const AUTH_EVENT = 'dnsfilter:auth-required'
 export function getToken() {
   try { return localStorage.getItem(TOKEN_KEY) || '' } catch { return '' }
 }
@@ -23,6 +24,7 @@ async function req(path, options = {}) {
   })
   const body = res.status === 204 ? null : await res.json().catch(() => null)
   if (!res.ok) {
+    if (res.status === 401) window.dispatchEvent(new Event(AUTH_EVENT))
     const err = new Error(body?.error || `${res.status} ${res.statusText}`)
     err.status = res.status
     throw err
@@ -45,6 +47,7 @@ export const api = {
   addBlocked: (domain, category = 'custom') =>
     req('/blocklist', { method: 'POST', body: JSON.stringify({ domain, category }) }),
   removeBlocked: (domain) => req(`/blocklist?domain=${q(domain)}`, { method: 'DELETE' }),
+  reloadBlocklists: () => req('/blocklist/reload', { method: 'POST' }),
   allowlist: () => req('/allowlist'),
   allow: (domain) => req('/allowlist', { method: 'POST', body: JSON.stringify({ domain }) }),
   unallow: (domain) => req(`/allowlist?domain=${q(domain)}`, { method: 'DELETE' }),

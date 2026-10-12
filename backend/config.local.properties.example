@@ -1,0 +1,15 @@
+# Copy to config.local.properties (git-ignored) and keep only the keys you want to change.
+# It is read from the directory you start the server in (backend/ for the run scripts),
+# layered over src/main/resources/config.properties.
+
+# A network that blocks outside DNS servers (e.g. campus Wi-Fi): use its own resolver first.
+# The public fallbacks still take over when you're on another network.
+#upstream.host=172.17.18.2
+#upstream.fallback=1.1.1.1,8.8.8.8
+
+# Filter your whole machine: port 53 needs Administrator / root.
+#dns.port=53
+
+# Open the dashboard from your phone on the same Wi-Fi: listen on all interfaces, with a token.
+#api.bind=0.0.0.0
+#api.token=change-me-to-a-long-random-string

@@ -14,6 +14,9 @@ import com.sankar.dnsfilter.resolver.UpstreamResolver;
 import com.sankar.dnsfilter.stats.QueryLogEntry;
 import com.sankar.dnsfilter.stats.StatsCollector;
 
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * The core pipeline for a single query:
  *   1. parse      -> DnsParser               malformed -> FORMERR
@@ -24,9 +27,25 @@ import com.sankar.dnsfilter.stats.StatsCollector;
  *
  * Blocking is checked BEFORE the cache, so adding a domain to the blocklist takes effect
  * immediately even if an answer for it is still cached.
+ *
+ * Size limits: a UDP client only accepts replies up to 512 bytes, or the size it advertised in an
+ * EDNS(0) OPT record. A bigger reply (from the cache or upstream) is replaced by an empty TC=1
+ * reply, and the client retries over TCP, where TcpDnsServer calls us with Transport.TCP and we
+ * forward over TCP too. The cache key includes the EDNS variant (none / EDNS / EDNS+DO), so an
+ * answer fetched with DNSSEC records for one client is never handed to a plain client.
  */
 public class QueryHandler {
     private static final int RCODE_NOTIMP = 4;
+
+    /** How the query reached us; decides the reply size limit and how we talk to upstream. */
+    public enum Transport {
+        /** Size limit from EDNS (512 without); oversize -> TC=1. Upstream over UDP. */
+        UDP,
+        /** No size limit. Upstream over TCP, so a big answer arrives whole. */
+        TCP,
+        /** The dashboard's "test a domain" box: no size limit, upstream over UDP. */
+        HTTP
+    }
 
     /** Tunables, read from config.properties (defaults in brackets). */
     public static final class Settings {
@@ -40,6 +59,18 @@ public class QueryHandler {
         public long negativeTtl = 300;
         /** dns.logQueries - print one line per query   [true] */
         public boolean logQueries = true;
+        /**
+         * upstream.maxInFlight - upstream lookups allowed at once; more -> immediate SERVFAIL; 0 = no cap   [12]
+         * Kept below dns.workers so a flood of never-seen names can't occupy every worker waiting on
+         * upstream: the rest stay free for cached and blocked names, which answer in microseconds.
+         */
+        public int maxUpstreamInFlight = 12;
+        /**
+         * dns.maxUdpSize - largest UDP reply we send even if the client's EDNS asks for more   [1232]
+         * 1232 is the DNS Flag Day 2020 value: avoids IP fragmentation, and limits how much a spoofed
+         * 60-byte query can be amplified (about 20x instead of 4096 / 60 = 68x). Bigger -> TC=1 -> TCP.
+         */
+        public int maxUdpSize = 1232;
 
         public static Settings from(Config c) {
             Settings s = new Settings();
@@ -48,6 +79,8 @@ public class QueryHandler {
             s.maxTtl = c.getInt("cache.maxTtl", 86_400);
             s.negativeTtl = c.getInt("cache.negativeTtl", 300);
             s.logQueries = Boolean.parseBoolean(c.get("dns.logQueries", "true").trim());
+            s.maxUpstreamInFlight = c.getInt("upstream.maxInFlight", 12);
+            s.maxUdpSize = Math.max(512, c.getInt("dns.maxUdpSize", 1232));
             return s;
         }
     }
@@ -57,6 +90,8 @@ public class QueryHandler {
     private final UpstreamResolver upstream;
     private final StatsCollector stats;
     private final Settings settings;
+    private final Semaphore upstreamSlots;           // null = unlimited
+    private final AtomicLong upstreamBusy = new AtomicLong();
 
     public QueryHandler(Blocklist blocklist, DnsCache cache, UpstreamResolver upstream, StatsCollector stats) {
         this(blocklist, cache, upstream, stats, new Settings());
@@ -69,7 +104,11 @@ public class QueryHandler {
         this.upstream = upstream;
         this.stats = stats;
         this.settings = settings;
+        this.upstreamSlots = settings.maxUpstreamInFlight > 0 ? new Semaphore(settings.maxUpstreamInFlight) : null;
     }
+
+    /** Queries answered SERVFAIL at once because maxUpstreamInFlight lookups were already running. */
+    public long upstreamBusy() { return upstreamBusy.get(); }
 
     /** Outcome of one query: the reply bytes (null = drop) plus what the pipeline decided. */
     public static final class Result {
@@ -90,11 +129,15 @@ public class QueryHandler {
 
     /** Called by DnsServer for every UDP packet. */
     public byte[] handle(byte[] query, String clientIp) {
-        return resolve(query, clientIp).reply;
+        return resolve(query, clientIp, Transport.UDP).reply;
     }
 
     /** Same pipeline, but also reports the decision - used by the HTTP "test a domain" endpoint. */
     public Result resolve(byte[] query, String clientIp) {
+        return resolve(query, clientIp, Transport.HTTP);
+    }
+
+    public Result resolve(byte[] query, String clientIp, Transport transport) {
         long start = System.nanoTime();
 
         // 1. Parse. Malformed packets get FORMERR (if we can at least read the header) or are dropped.
@@ -131,23 +174,34 @@ public class QueryHandler {
         }
 
         // 3. Cache. Only single-question queries are cacheable (multi-question is ~never used).
-        String key = msg.questions.size() == 1 ? DnsCache.key(domain, q.type) : null;
+        DnsWriter.Edns edns = DnsWriter.edns(query, query.length);
+        String key = msg.questions.size() == 1 ? DnsCache.key(domain, q.type, edns) : null;
         if (key != null) {
             byte[] cached = cache.get(key);
             if (cached != null) {
-                byte[] reply = DnsWriter.prepareCachedReply(cached, query, query.length);
-                return finish(reply, start, clientIp, domain, type, QueryLogEntry.Status.CACHED, null, "CACHED");
+                byte[] reply = fit(DnsWriter.prepareCachedReply(cached, query, query.length), query, edns, transport);
+                return finish(reply, start, clientIp, domain, type, QueryLogEntry.Status.CACHED, null,
+                        reply.length < cached.length ? "CACHED, truncated (TC) for UDP" : "CACHED");
             }
         }
 
         // 4. Forward to upstream; on timeout/error answer SERVFAIL so the client doesn't hang.
+        //    If too many lookups are already waiting on upstream, fail fast instead of queueing.
+        if (upstreamSlots != null && !upstreamSlots.tryAcquire()) {
+            upstreamBusy.incrementAndGet();
+            byte[] reply = DnsWriter.buildErrorResponse(query, query.length, DnsHeader.RCODE_SERVFAIL);
+            return finish(reply, start, clientIp, domain, type, QueryLogEntry.Status.ERROR, null,
+                    "SERVFAIL (upstream busy: " + settings.maxUpstreamInFlight + " lookups in flight)");
+        }
         byte[] reply;
         try {
-            reply = upstream.forward(query);
+            reply = transport == Transport.TCP ? upstream.forwardTcp(query) : upstream.forward(query);
         } catch (Exception e) {
             reply = DnsWriter.buildErrorResponse(query, query.length, DnsHeader.RCODE_SERVFAIL);
             return finish(reply, start, clientIp, domain, type, QueryLogEntry.Status.ERROR, null,
                     "SERVFAIL (" + e.getClass().getSimpleName() + ": " + e.getMessage() + ")");
+        } finally {
+            if (upstreamSlots != null) upstreamSlots.release();
         }
 
         String outcome;
@@ -161,7 +215,21 @@ public class QueryHandler {
             // We can't fully parse it, but the client might - relay it anyway (uncached) and log why.
             outcome = "unparsed reply, not cached (" + e.getMessage() + ")";
         }
-        return finish(reply, start, clientIp, domain, type, QueryLogEntry.Status.FORWARDED, null, outcome);
+        byte[] fitted = fit(reply, query, edns, transport);
+        if (fitted != reply) outcome += ", truncated (TC) for UDP";
+        return finish(fitted, start, clientIp, domain, type, QueryLogEntry.Status.FORWARDED, null, outcome);
+    }
+
+    /**
+     * A UDP reply bigger than the client accepts would be cut off by the network stack (or dropped),
+     * so send an empty TC=1 reply instead and let the client retry over TCP. The limit is the
+     * client's (512, or its EDNS size) but never above maxUdpSize, whatever the client claims.
+     */
+    private byte[] fit(byte[] reply, byte[] query, DnsWriter.Edns edns, Transport transport) {
+        int limit = Math.min(edns.udpSize, settings.maxUdpSize);
+        if (transport != Transport.UDP || reply.length <= limit) return reply;
+        int rcode = reply.length > 3 ? reply[3] & DnsHeader.MASK_RCODE : DnsHeader.RCODE_NOERROR;
+        return DnsWriter.buildTruncatedResponse(query, query.length, rcode);
     }
 
     /**

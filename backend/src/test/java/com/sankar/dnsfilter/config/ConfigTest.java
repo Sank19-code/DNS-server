@@ -2,6 +2,8 @@ package com.sankar.dnsfilter.config;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.Properties;
 
@@ -40,5 +42,17 @@ class ConfigTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> c.getInt("api.port", 8081));
         assertTrue(e.getMessage().contains("api.port"));
         assertEquals("DNSFILTER_UPSTREAM_TIMEOUTMS", Config.envName("upstream.timeoutMs"));
+    }
+
+    @Test
+    void localFileOverridesTheBundledDefaults() throws Exception {
+        Path local = Files.createTempFile("config.local", ".properties");
+        Files.writeString(local, "cache.maxEntries=12345\n");
+        Config c = Config.load(null, local);
+        assertEquals(12345, c.getInt("cache.maxEntries", 0), "from the local file");
+        assertEquals(5300, c.getInt("dns.port", 0), "everything else still from config.properties");
+
+        Config withoutLocal = Config.load(null, local.resolveSibling("missing.properties"));
+        assertEquals(1000, withoutLocal.getInt("cache.maxEntries", 0));
     }
 }

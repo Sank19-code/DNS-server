@@ -17,10 +17,12 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -222,14 +224,107 @@ class ApiServerTest {
     }
 
     @Test
-    void adminTokenProtectsMutationsButNotReads() throws Exception {
+    void adminTokenProtectsMutationsAndReads() throws Exception {
         base = startApi("api.token=s3cret\n");
         String body = "{\"domain\":\"evil.com\"}";
         assertEquals(401, send("POST", "/blocklist", body, null).statusCode());
         assertEquals(401, send("POST", "/blocklist", body, "wrong").statusCode());
         assertEquals(401, send("DELETE", "/cache", null, null).statusCode());
         assertEquals(201, send("POST", "/blocklist", body, "s3cret").statusCode());
-        assertEquals(200, send("GET", "/stats", null, null).statusCode());
+        // the query log is browsing history: reads need the token too
+        assertEquals(401, send("GET", "/queries", null, null).statusCode());
+        assertEquals(401, send("GET", "/stats", null, null).statusCode());
+        assertEquals(200, send("GET", "/stats", null, "s3cret").statusCode());
+        assertEquals(200, send("GET", "/health", null, null).statusCode(), "health stays open for monitoring");
+    }
+
+    @Test
+    void publicReadsKeepsGetsOpenButNotMutations() throws Exception {
+        base = startApi("api.token=s3cret\napi.publicReads=true\n");
+        assertEquals(200, send("GET", "/queries", null, null).statusCode());
+        assertEquals(401, send("POST", "/blocklist", "{\"domain\":\"evil.com\"}", null).statusCode());
+    }
+
+    @Test
+    void crossSiteBrowserRequestsAreRefused() throws Exception {
+        String body = "{\"domain\":\"malware.example\"}";
+        // a page on another site POSTing to our localhost API
+        assertEquals(403, sendWithOrigin("POST", "/allowlist", body, "https://evil.example").statusCode());
+        assertEquals(403, sendWithOrigin("DELETE", "/cache", null, "null").statusCode());
+        assertEquals(0, blocklist.allowedSize());
+        // the dashboard itself (same origin) and the Vite dev server on another localhost port are fine
+        String self = base.substring(0, base.length() - "/api".length());
+        assertEquals(201, sendWithOrigin("POST", "/allowlist", body, self).statusCode());
+        assertEquals(200, sendWithOrigin("DELETE", "/cache", null, "http://localhost:5173").statusCode());
+    }
+
+    @Test
+    void postBodyMustBeJson() throws Exception {
+        // text/plain is a "simple" request: browsers send it cross-site without asking first
+        HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(base + "/blocklist"))
+                .POST(HttpRequest.BodyPublishers.ofString("{\"domain\":\"evil.com\"}"))
+                .header("Content-Type", "text/plain").build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(415, r.statusCode());
+        assertFalse(blocklist.isListed("evil.com"));
+    }
+
+    @Test
+    void noCorsHeadersUnlessAnOriginIsConfigured() throws Exception {
+        HttpResponse<String> r = sendWithOrigin("OPTIONS", "/blocklist", null, "https://evil.example");
+        assertTrue(r.headers().firstValue("Access-Control-Allow-Origin").isEmpty());
+
+        base = startApi("api.corsOrigin=https://dash.example.com\n");
+        r = sendWithOrigin("OPTIONS", "/blocklist", null, "https://dash.example.com");
+        assertEquals("https://dash.example.com", r.headers().firstValue("Access-Control-Allow-Origin").orElse(""));
+        assertEquals(201, sendWithOrigin("POST", "/blocklist", "{\"domain\":\"x.com\"}", "https://dash.example.com").statusCode());
+
+        base = startApi("api.corsOrigin=*\n");   // ignored without a token
+        r = sendWithOrigin("GET", "/health", null, "https://evil.example");
+        assertTrue(r.headers().firstValue("Access-Control-Allow-Origin").isEmpty());
+    }
+
+    @Test
+    void dnsRebindingHostIsRefusedWithoutToken() throws Exception {
+        int port = Integer.parseInt(base.replaceAll(".*:(\\d+)/api", "$1"));
+        assertTrue(rawHttp(port, "evil.example:" + port).startsWith("HTTP/1.1 403"));
+        assertTrue(rawHttp(port, "127.evil.example").startsWith("HTTP/1.1 403"));
+        assertTrue(rawHttp(port, "localhost:" + port).startsWith("HTTP/1.1 200"));
+        assertTrue(rawHttp(port, "192.168.1.5:" + port).startsWith("HTTP/1.1 200"));
+
+        base = startApi("api.allowedHosts=mypc.lan\n");
+        port = Integer.parseInt(base.replaceAll(".*:(\\d+)/api", "$1"));
+        assertTrue(rawHttp(port, "mypc.lan:" + port).startsWith("HTTP/1.1 200"));
+    }
+
+    @Test
+    void refusesToExposeTheApiWithoutAToken() throws Exception {
+        Path cfg = Files.createTempFile("api", ".properties");
+        Files.writeString(cfg, "api.port=0\napi.bind=0.0.0.0\n");
+        ApiServer open = new ApiServer(Config.load(cfg.toString()), stats, blocklist, cache, handler);
+        IllegalStateException e = assertThrows(IllegalStateException.class, open::start);
+        assertTrue(e.getMessage().contains("DNSFILTER_API_TOKEN"));
+
+        Files.writeString(cfg, "api.port=0\napi.bind=0.0.0.0\napi.token=s3cret\n");
+        ApiServer withToken = new ApiServer(Config.load(cfg.toString()), stats, blocklist, cache, handler);
+        withToken.start();
+        withToken.stop();
+    }
+
+    private HttpResponse<String> sendWithOrigin(String method, String path, String body, String origin) throws Exception {
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base + path))
+                .method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body))
+                .header("Content-Type", "application/json")
+                .header("Origin", origin).build();
+        return http.send(req, HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** GET /api/queries with a hand-written Host header (HttpClient won't let us set one). */
+    private static String rawHttp(int port, String host) throws Exception {
+        try (Socket s = new Socket("127.0.0.1", port)) {
+            s.getOutputStream().write(("GET /api/queries HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")
+                    .getBytes(StandardCharsets.US_ASCII));
+            return new String(s.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        }
     }
 
     @Test
@@ -273,6 +368,54 @@ class ApiServerTest {
         HttpResponse<String> r = raw(url);
         assertEquals(200, r.statusCode(), url);
         return r;
+    }
+
+    @Test
+    void reloadEndpointRunsTheReloadAndNeedsTheToken() throws Exception {
+        int[] reloads = {0};
+        base = startApi("api.token=s3cret\n");
+        api.onReloadBlocklists(() -> reloads[0]++);
+        assertEquals(401, send("POST", "/blocklist/reload", null, null).statusCode());
+        HttpResponse<String> r = send("POST", "/blocklist/reload", null, "s3cret");
+        assertEquals(200, r.statusCode(), r.body());
+        assertEquals(1, reloads[0]);
+        assertEquals(1, JsonParser.parseString(r.body()).getAsJsonObject().get("size").getAsInt());
+        assertEquals(405, send("GET", "/blocklist/reload", null, "s3cret").statusCode());
+    }
+
+    @Test
+    void httpServerLimitsAreAppliedUnlessAlreadySet() throws Exception {
+        // start() ran in setUp: the JDK server limits must be set (it has none by default)
+        assertNotNull(System.getProperty("jdk.httpserver.maxConnections"));
+        assertNotNull(System.getProperty("sun.net.httpserver.maxReqTime"));
+        String before = System.getProperty("sun.net.httpserver.maxRspTime");
+        System.setProperty("sun.net.httpserver.maxRspTime", "77");
+        try {
+            Path cfg = Files.createTempFile("api", ".properties");
+            Files.writeString(cfg, "api.maxResponseSec=5\n");
+            ApiServer.applyHttpServerLimits(Config.load(cfg.toString()));
+            assertEquals("77", System.getProperty("sun.net.httpserver.maxRspTime"), "a -D value wins");
+        } finally {
+            if (before == null) System.clearProperty("sun.net.httpserver.maxRspTime");
+            else System.setProperty("sun.net.httpserver.maxRspTime", before);
+        }
+    }
+
+    @Test
+    void stalledRequestHeadersAreDroppedAndTheServerStaysUsable() throws Exception {
+        // Slowloris: open many connections and never finish the headers. The other requests must
+        // still be answered (the dispatcher doesn't block on them, and connections are capped).
+        int port = Integer.parseInt(base.replaceAll(".*:(\\d+)/api", "$1"));
+        Socket[] slow = new Socket[20];
+        try {
+            for (int i = 0; i < slow.length; i++) {
+                slow[i] = new Socket("127.0.0.1", port);
+                slow[i].getOutputStream().write("GET /api/stats HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Slow: ".getBytes(StandardCharsets.US_ASCII));
+            }
+            assertEquals(200, send("GET", "/health", null, null).statusCode());
+        } finally {
+            for (Socket s : slow) if (s != null) s.close();
+        }
     }
 
     @Test

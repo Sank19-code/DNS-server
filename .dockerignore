@@ -7,3 +7,5 @@ logs
 *.log
 .env
 .env.*
+data
+**/config.local.properties

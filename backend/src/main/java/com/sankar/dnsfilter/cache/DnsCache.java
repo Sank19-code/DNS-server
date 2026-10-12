@@ -35,6 +35,17 @@ public class DnsCache {
         return n + ":" + type;
     }
 
+    /**
+     * Key that also separates EDNS variants: "name:type" for plain queries, ":e" with EDNS, ":do"
+     * with EDNS + DNSSEC OK. Replies differ between them (OPT record, RRSIGs, size), and a client
+     * must not get an OPT record it didn't ask for or miss DNSSEC records it did ask for.
+     */
+    public static String key(String name, int type, DnsWriter.Edns edns) {
+        String base = key(name, type);
+        if (!edns.present) return base;
+        return base + (edns.dnssecOk ? ":do" : ":e");
+    }
+
     /** @return a copy of the cached reply with TTLs aged, or null on miss / expiry. */
     public byte[] get(String key) {
         long now = clock.getAsLong();
