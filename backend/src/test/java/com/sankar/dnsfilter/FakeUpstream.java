@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * stay silent, or send a spoofed wrong-ID reply before the real one.
  */
 public class FakeUpstream implements AutoCloseable {
-    public enum Mode { NORMAL, SILENT, WRONG_ID_FIRST }
+    public enum Mode { NORMAL, SILENT, WRONG_ID_FIRST, DROP_FIRST }
 
     private final DatagramSocket socket;
     private final Thread thread;
@@ -43,9 +43,10 @@ public class FakeUpstream implements AutoCloseable {
             try {
                 DatagramPacket p = new DatagramPacket(buf, buf.length);
                 socket.receive(p);
-                queries.incrementAndGet();
+                int n = queries.incrementAndGet();
                 byte[] q = Arrays.copyOf(p.getData(), p.getLength());
                 if (mode == Mode.SILENT) continue;
+                if (mode == Mode.DROP_FIRST && n == 1) continue;   // simulate one lost packet
                 byte[] reply = isNx(q) ? nxWithSoa(q) : DnsWriter.buildNullRouteResponse(q, q.length, answerTtl);
                 if (mode == Mode.WRONG_ID_FIRST) {
                     int id = ((q[0] & 0xFF) << 8) | (q[1] & 0xFF);

@@ -61,6 +61,7 @@ import java.util.regex.Pattern;
  *   DELETE /api/allowlist?domain=x               *
  *   GET    /api/cache                      cache size / hit ratio / evictions
  *   DELETE /api/cache                      flush the cache                 *
+ *   GET    /                               the built dashboard (frontend/dist), if present
  *
  *  * = mutating. If an admin token is configured (env DNSFILTER_API_TOKEN or api.token), these
  *      require "Authorization: Bearer <token>". Reads stay public so the dashboard demo works.
@@ -93,8 +94,7 @@ public class ApiServer {
         this.handler = handler;
         // /api/resolve makes the server query upstream, so a public demo must not be a free proxy.
         this.resolveLimiter = new RateLimiter(config.getInt("api.resolve.qps", 5), config.getInt("api.resolve.burst", 20));
-        String envToken = System.getenv("DNSFILTER_API_TOKEN");
-        String token = envToken != null && !envToken.isBlank() ? envToken : config.get("api.token", "");
+        String token = config.get("api.token", ""); // env DNSFILTER_API_TOKEN overrides (see Config)
         this.adminToken = token.isBlank() ? null : token.trim();
         this.corsOrigin = config.get("api.corsOrigin", "*").trim();
     }
@@ -125,8 +125,15 @@ public class ApiServer {
                 "GET", r -> cacheBody(),
                 "DELETE", this::flushCache));
 
+        // Production: serve the built dashboard from the same port (see StaticFiles).
+        java.nio.file.Path staticDir = java.nio.file.Paths.get(config.get("api.staticDir", "../frontend/dist").trim());
+        boolean servingUi = java.nio.file.Files.isRegularFile(staticDir.resolve("index.html"));
+        if (servingUi) server.createContext("/", new StaticFiles(staticDir));
+
         server.start();
         int bound = server.getAddress().getPort();
+        if (servingUi) System.out.println("Dashboard served from " + staticDir.toAbsolutePath().normalize()
+                + " at http://localhost:" + bound + "/");
         System.out.println("REST API listening on http://" + bind + ":" + bound + "/api"
                 + (adminToken == null ? " (no admin token: mutating endpoints are open - dev mode)"
                                       : " (admin token required for POST/DELETE)"));
@@ -369,7 +376,10 @@ public class ApiServer {
             }
         }
 
-        String clientIp() { return ex.getRemoteAddress().getAddress().getHostAddress(); }
+        String clientIp() {
+            java.net.InetAddress a = ex.getRemoteAddress().getAddress();
+            return a.isLoopbackAddress() ? "localhost" : a.getHostAddress();
+        }
 
         JsonObject jsonBody() {
             String body;

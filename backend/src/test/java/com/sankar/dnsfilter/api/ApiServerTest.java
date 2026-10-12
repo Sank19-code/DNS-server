@@ -233,6 +233,49 @@ class ApiServerTest {
     }
 
     @Test
+    void servesDashboardWithSpaFallbackAndNoTraversal() throws Exception {
+        Path dist = Files.createTempDirectory("dist");
+        Files.writeString(dist.resolve("index.html"), "<html>dashboard</html>");
+        Files.createDirectories(dist.resolve("assets"));
+        Files.writeString(dist.resolve("assets/app.js"), "console.log(1)");
+        Files.writeString(dist.getParent().resolve("secret-" + dist.getFileName() + ".txt"), "do not serve");
+        base = startApi("api.staticDir=" + dist.toAbsolutePath().toString().replace('\\', '/') + "\n");
+        String root = base.substring(0, base.length() - "/api".length());
+
+        HttpResponse<String> index = get200(root + "/");
+        assertTrue(index.body().contains("dashboard"));
+        assertEquals("no-cache", index.headers().firstValue("Cache-Control").orElse(""));
+
+        HttpResponse<String> js = get200(root + "/assets/app.js");
+        assertTrue(js.headers().firstValue("Content-Type").orElse("").startsWith("text/javascript"));
+        assertTrue(js.headers().firstValue("Cache-Control").orElse("").contains("immutable"));
+
+        // client-side route -> index.html; missing asset -> real 404; API routes still win over "/"
+        assertTrue(get200(root + "/some/page").body().contains("dashboard"));
+        assertEquals(404, raw(root + "/assets/nope.js").statusCode());
+        assertEquals(200, send("GET", "/health", null, null).statusCode());
+
+        // ../ escapes are refused (percent-encoded so the HTTP client can't normalize them away)
+        HttpResponse<String> evil = raw(root + "/%2e%2e/secret-" + dist.getFileName() + ".txt");
+        assertEquals(403, evil.statusCode());
+        assertFalse(evil.body().contains("do not serve"));
+
+        HttpResponse<String> post = http.send(HttpRequest.newBuilder(URI.create(root + "/"))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(405, post.statusCode());
+    }
+
+    private HttpResponse<String> raw(String url) throws Exception {
+        return http.send(HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> get200(String url) throws Exception {
+        HttpResponse<String> r = raw(url);
+        assertEquals(200, r.statusCode(), url);
+        return r;
+    }
+
+    @Test
     void resolveIsRateLimited() throws Exception {
         base = startApi("api.resolve.qps=1\napi.resolve.burst=2\n");
         assertEquals(200, send("GET", "/resolve?name=a.com", null, null).statusCode());

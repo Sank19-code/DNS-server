@@ -1,0 +1,20 @@
+# docker compose up --build    ->  dashboard on http://localhost:8081, DNS on UDP 5300
+services:
+  dns-filter:
+    build: .
+    ports:
+      - "5300:5300/udp"
+      - "8081:8081"
+    environment:
+      # Set in a .env file next to this one (git-ignored) or your shell. Empty = dev mode.
+      DNSFILTER_API_TOKEN: ${DNSFILTER_API_TOKEN:-}
+      DNSFILTER_UPSTREAM_HOST: ${DNSFILTER_UPSTREAM_HOST:-1.1.1.1}
+      DNSFILTER_API_CORSORIGIN: ${DNSFILTER_API_CORSORIGIN:-*}
+    volumes:
+      - blocklist-cache:/app/blocklists/downloaded   # keep the downloaded list across restarts
+    restart: unless-stopped
+    # On a Linux server, `network_mode: host` (instead of ports:) lets the rate limiter see real
+    # client IPs rather than Docker's NAT address.
+
+volumes:
+  blocklist-cache: {}

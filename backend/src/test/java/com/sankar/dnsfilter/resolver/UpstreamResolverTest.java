@@ -49,4 +49,48 @@ class UpstreamResolverTest {
             assertEquals(1, alive.queries.get());
         }
     }
+
+    @Test
+    void retransmitsWhenTheFirstPacketIsLost() throws Exception {
+        try (FakeUpstream up = new FakeUpstream()) {
+            up.mode = FakeUpstream.Mode.DROP_FIRST;
+            UpstreamResolver r = new UpstreamResolver(List.of(up.address()), 1000, 150);
+            long t = System.currentTimeMillis();
+            DnsMessage m = new DnsParser(r.forward(QUERY)).parse();
+            long took = System.currentTimeMillis() - t;
+            assertEquals(1, m.answers.size());
+            assertEquals(2, up.queries.get(), "query was sent twice");
+            assertEquals(1, r.retransmits());
+            assertTrue(took >= 140 && took < 900, "answered after the retransmit, not the full timeout: " + took + " ms");
+        }
+    }
+
+    @Test
+    void withoutRetransmitALostPacketTimesOut() throws Exception {
+        try (FakeUpstream up = new FakeUpstream()) {
+            up.mode = FakeUpstream.Mode.DROP_FIRST;
+            UpstreamResolver r = new UpstreamResolver(List.of(up.address()), 200, 0);
+            assertThrows(SocketTimeoutException.class, () -> r.forward(QUERY));
+            assertEquals(1, up.queries.get());
+        }
+    }
+
+    @Test
+    void remembersTheUpstreamThatWorked() throws Exception {
+        try (FakeUpstream campus = new FakeUpstream(); FakeUpstream home = new FakeUpstream()) {
+            campus.mode = FakeUpstream.Mode.SILENT;              // off campus: campus resolver unreachable
+            UpstreamResolver r = new UpstreamResolver(List.of(campus.address(), home.address()), 200);
+            r.forward(QUERY);
+            assertEquals(home.address(), r.preferredUpstream());
+            r.forward(QUERY);
+            r.forward(QUERY);
+            assertEquals(1, campus.queries.get(), "the dead upstream costs one timeout, not one per query");
+            assertEquals(3, home.queries.get());
+
+            home.mode = FakeUpstream.Mode.SILENT;                // back on campus
+            campus.mode = FakeUpstream.Mode.NORMAL;
+            r.forward(QUERY);
+            assertEquals(campus.address(), r.preferredUpstream());
+        }
+    }
 }

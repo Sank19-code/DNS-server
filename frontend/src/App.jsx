@@ -1,46 +1,54 @@
-import { useEffect, useState } from 'react'
 import { api } from './api/client.js'
+import { usePoll } from './hooks/usePoll.js'
+import { uptime } from './lib/format.js'
 import StatsCards from './components/StatsCards.jsx'
-import QueryLog from './components/QueryLog.jsx'
+import TrafficChart from './components/TrafficChart.jsx'
+import TestDomain from './components/TestDomain.jsx'
 import TopDomains from './components/TopDomains.jsx'
+import LatencyTable from './components/LatencyTable.jsx'
 import BlocklistManager from './components/BlocklistManager.jsx'
-
-const POLL_MS = 2000
+import QueryLog from './components/QueryLog.jsx'
 
 export default function App() {
-  const [stats, setStats] = useState(null)
-  const [queries, setQueries] = useState([])
-  const [error, setError] = useState(null)
+  const stats = usePoll(api.stats, 2000)
+  const top = usePoll(() => api.top(8), 5000)
+  const series = usePoll(api.timeseries, 5000)
+  const s = stats.data
+  const down = Boolean(stats.error)
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const [s, q] = await Promise.all([api.stats(), api.queries(100)])
-        setStats(s)
-        setQueries(q)
-        setError(null)
-      } catch (e) {
-        setError('Backend not reachable - is the Java server running on :8081?')
-      }
-    }
-    load()
-    const id = setInterval(load, POLL_MS)
-    return () => clearInterval(id)
-  }, [])
+  const refreshAll = () => { stats.refresh(); top.refresh(); series.refresh() }
 
   return (
     <div className="app">
-      <header>
+      <header className="top">
         <h1>DNS Filter</h1>
-        <span className={error ? 'dot red' : 'dot green'} />
-        <span className="muted">{error ?? 'Live'}</span>
+        <span className={`live ${down ? 'down' : ''}`} role="status">
+          <i className="dot" aria-hidden="true" />
+          {down ? 'Backend unreachable — is the Java server running on :8081?' : 'Live'}
+        </span>
+        {s && (
+          <div className="meta muted">
+            <span>Up {uptime(s.uptimeSeconds)}</span>
+            <span>Upstream {s.upstreams?.join(', ')}</span>
+          </div>
+        )}
       </header>
-      <StatsCards stats={stats} />
-      <div className="grid">
-        <TopDomains />
-        <BlocklistManager />
+
+      <StatsCards stats={s} />
+
+      <div className="row-2">
+        <TrafficChart series={series.data} />
+        <TestDomain onDone={refreshAll} upstream={s?.upstreams?.[0]} />
       </div>
-      <QueryLog queries={queries} />
+
+      <TopDomains top={top.data} />
+
+      <div className="row-even">
+        <LatencyTable latency={s?.latencyMs} />
+        <BlocklistManager stats={s} onChange={refreshAll} />
+      </div>
+
+      <QueryLog />
     </div>
   )
 }

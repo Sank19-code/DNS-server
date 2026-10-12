@@ -1,0 +1,9 @@
+.git
+**/node_modules
+frontend/dist
+backend/target
+blocklists/downloaded
+logs
+*.log
+.env
+.env.*
