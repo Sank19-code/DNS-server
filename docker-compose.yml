@@ -10,8 +10,11 @@ services:
       # "8081:8081" (or better: put Caddy in front, see docs/DEPLOY.md).
       - "127.0.0.1:8081:8081"
     environment:
-      # Set in a .env file next to this one (git-ignored) or your shell.
+      # Set in a .env file next to this one (git-ignored) or your shell. Only variables listed
+      # here reach the container: a new DNSFILTER_ setting in .env must also be added below.
       DNSFILTER_API_TOKEN: ${DNSFILTER_API_TOKEN:-}
+      # true = dashboard GETs (stats, query log, "Test a domain") need no token: a public demo.
+      DNSFILTER_API_PUBLICREADS: ${DNSFILTER_API_PUBLICREADS:-false}
       # Inside the container the API has to listen on 0.0.0.0, which is refused without a token
       # unless api.insecure=true. That is only acceptable because port 8081 above is published on
       # 127.0.0.1. It has no effect once a token is set.
