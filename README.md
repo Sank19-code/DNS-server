@@ -8,7 +8,7 @@ No frameworks: `DatagramSocket`, the JDK's built-in `HttpServer`, and Gson are t
 
 ![Dashboard](docs/screenshot.png)
 
-**Stack:** Java 17 · Maven · JUnit 5 (113 tests) · React 18 + Vite + Recharts · Docker
+**Stack:** Java 17 · Maven · JUnit 5 (134 tests) · React 18 + Vite + Recharts + Vitest · Docker · GitHub Actions
 
 ---
 
@@ -21,7 +21,12 @@ No frameworks: `DatagramSocket`, the JDK's built-in `HttpServer`, and Gson are t
   DNSSEC answers arrive whole.
 - **Blocks by domain and every subdomain**: blocking `doubleclick.net` also blocks `ad.doubleclick.net`.
   Reads plain, hosts-file and adblock (`||x^`) list formats, downloads the StevenBlack list, and
-  re-downloads it every 24 h while running (or on demand from the dashboard).
+  re-downloads it every 24 h while running (or on demand from the dashboard). A download that is
+  oversized or suspiciously small (an error page, a cut-off file) is rejected and the old list kept.
+- **Catches hidden trackers**: if an answer's CNAME alias is blocked (`metrics.news-site.com` →
+  `tracker.adobe.com`, "CNAME cloaking"), the query is blocked too, also when served from the cache.
+- **Stops browsers going around it**: answers NXDOMAIN for the canary names that make Firefox switch
+  off its built-in DNS-over-HTTPS and Apple switch off iCloud Private Relay on this network.
 - **Remembers your edits**: blocks, unblocks and allows made from the dashboard are saved to
   `data/overrides.txt` and survive restarts and list refreshes. Dashboard totals, top lists and the
   query log are saved to `data/stats.json`.
@@ -29,8 +34,10 @@ No frameworks: `DatagramSocket`, the JDK's built-in `HttpServer`, and Gson are t
   hits. "Domain doesn't exist" answers are cached too (RFC 2308). Plain, EDNS and DNSSEC-OK queries
   get separate cache entries.
 - **Defends itself**: sends its own random transaction ID upstream from a random port, and only
-  accepts a reply with that ID, from that server, for that question. Rate-limits each client IP,
-  drops packets when overloaded, and validates all API input.
+  accepts a reply with that ID, from that server, for that question. Rate-limits each client IP
+  (each /64 for IPv6), drops packets when overloaded, and validates all API input.
+- **Picks the right upstream**: a SERVFAIL or REFUSED answer moves on to the next upstream, and
+  after switching to a fallback it tries the primary again every 60 s.
 - **Safe dashboard by default**: the API listens on localhost only and refuses to listen anywhere
   else without an admin token. It also rejects cross-site browser requests and DNS-rebinding
   tricks, so a web page you visit can't read your query log or edit your lists. See
@@ -143,26 +150,30 @@ On a network that blocks outside DNS, such as campus Wi-Fi, put the network's re
 
 | Key | Default | Meaning |
 |---|---|---|
-| `dns.port` | `5300` | UDP + TCP port (53 needs admin/root) |
+| `dns.port` / `dns.bind` | `5300` / `::` | UDP + TCP port (53 needs admin/root); `::` = IPv6 + IPv4, IPv4 only where IPv6 is off |
+| `dns.blockBypassCanaries` | `true` | NXDOMAIN for the Firefox DoH and iCloud Private Relay canary names |
 | `dns.tcp.enabled` / `.maxConnections` / `.maxConnectionsPerClient` | `true` / `64` / `8` | DNS over TCP |
 | `dns.tcp.idleTimeoutMs` / `.messageTimeoutMs` / `.writeTimeoutMs` | `10000` / `2000` / `5000` | TCP Slowloris limits |
 | `dns.maxUdpSize` | `1232` | largest UDP reply, whatever EDNS asks for |
 | `upstream.host` / `upstream.fallback` | `1.1.1.1` / `8.8.8.8,9.9.9.9` | where cache misses go; whichever answers is tried first from then on |
 | `upstream.timeoutMs` | `1500` | per-upstream timeout before `SERVFAIL` |
 | `upstream.maxInFlight` | `12` | upstream lookups at once (keep below `dns.workers`); more → instant `SERVFAIL` |
-| `cache.maxEntries` / `cache.maxTtl` / `cache.negativeTtl` | `1000` / `86400` / `300` | cache size and TTL caps |
+| `upstream.primaryRetrySec` | `60` | after falling back, try the primary first again this often; `0` = never |
+| `cache.maxEntries` / `cache.maxTtl` / `cache.negativeTtl` | `10000` / `86400` / `300` | cache size and TTL caps |
 | `blocklist.files` / `allowlist.file` | `../blocklists/*.txt` | local lists; category = file name |
 | `blocklist.remote` | StevenBlack hosts | `category\|url` lists, downloaded and cached on disk |
 | `blocklist.refreshHours` | `24` | re-download remote lists this often while running; `0` = startup only |
+| `blocklist.maxDownloadMb` / `blocklist.minKeepPercent` | `50` / `50` | reject a download over this size, or with under this % of the cached copy's domains |
 | `blocklist.overridesFile` | `../data/overrides.txt` | where dashboard edits are saved |
 | `stats.file` / `stats.saveIntervalSec` | `../data/stats.json` / `300` | saved dashboard numbers; empty = don't save |
 | `blocking.mode` | `nxdomain` | or `nullroute` (answer `0.0.0.0` / `::`) |
+| `blocking.cnameInspection` | `true` | also block when an answer's CNAME alias is blocked |
 | `dns.rateLimit.qps` / `.burst` | `50` / `100` | per-client token bucket, shared by UDP and TCP; `0` disables |
 | `dns.rateLimit.maxClients` | `10000` | client IPs the limiter remembers (LRU) |
 | `dns.rateLimit.globalQps` / `.globalBurst` | `2000` / `4000` | total queries/s across all clients; `0` disables |
 | `api.maxConnections` / `api.maxHeaderSec` / `api.maxResponseSec` | `100` / `10` / `30` | HTTP server limits |
 | `api.port` / `api.bind` | `8081` / `127.0.0.1` | REST API + dashboard |
-| `api.token` | empty | admin token; set via `DNSFILTER_API_TOKEN`. Required to bind beyond localhost |
+| `api.token` | empty | admin token (16+ characters); set via `DNSFILTER_API_TOKEN`. Required to bind beyond localhost |
 | `api.publicReads` | `false` | `true` = GET endpoints stay public even with a token (demo only) |
 | `api.allowedHosts` | empty | extra host names the dashboard may be opened by without a token |
 | `api.corsOrigin` | empty | a different origin allowed to call the API (`*` needs a token) |
@@ -184,8 +195,23 @@ down by default:
 - **No DNS rebinding.** Without a token, the `Host` header must be an IP address, `localhost`, or
   a name in `api.allowedHosts`. Otherwise `evil.example`, re-pointed at 127.0.0.1, would count as
   "same origin".
+- **Strong token.** Shorter than 16 characters is refused at startup (there's no lockout after
+  wrong guesses, so the token itself must be unguessable: `openssl rand -hex 24`).
+- **No framing.** `X-Frame-Options: DENY` and `frame-ancestors 'none'`, so another site can't lay
+  the dashboard invisibly over its own buttons and trick a click on "Block" or "Flush cache".
 - **Upstream anti-spoofing.** Each upstream query gets a fresh random transaction ID from
   `SecureRandom` and a random source port. A reply must match the ID, the server and the question.
+- **No cache poisoning between names.** A `.` inside a label is kept escaped (`www\.google.com`),
+  so the one-label name `www.google` + `com` can't share a cache entry with the real
+  `www.google.com`. Queries must have exactly one question (RFC 9619), so a blocked name can't
+  ride along as a second question. Name comparisons fold A-Z only, so they don't change with the
+  machine's language (in Turkish, `I` lower-cases to a dotless `ı`).
+
+**Browsers with their own DNS.** If a browser uses DNS-over-HTTPS, its lookups never reach this
+server. Firefox checks a canary name first, which this server answers so DoH stays off. Chrome
+and Edge only switch to DoH by themselves when your system's DNS server is a known DoH provider,
+which this one isn't. But if "Use secure DNS" is set by hand to a specific provider in their
+settings, turn that off.
 
 ### Floods and DoS
 
@@ -226,19 +252,25 @@ When a token is configured, every endpoint except `/api/health` needs `Authoriza
 
 ## Tests
 
-`cd backend && mvn test` runs 113 tests:
+`cd backend && mvn test` runs 134 tests:
 
-- **Parser**: truncated packets, compression-pointer loops, forward pointers, lying counts.
-- **Protocol helpers**: EDNS size and DO-bit detection, truncated replies, question matching.
+- **Parser**: truncated packets, compression-pointer loops, forward pointers, lying counts, dots
+  and backslashes inside labels kept escaped.
+- **Protocol helpers**: EDNS size and DO-bit detection, truncated replies, question matching,
+  ASCII-only case folding under a Turkish locale.
 - **Caches**: LRU eviction order, concurrent access, TTL expiry with a fake clock, TTL countdown.
 - **Blocklist**: all three list formats, parent matching on label boundaries, allowlist precedence,
-  saved overrides surviving a restart and a list refresh, atomic reload.
+  saved overrides surviving a restart and a list refresh, atomic reload, downloads that are too
+  big or suspiciously small being rejected (against a local HTTP server).
 - **Resolver**: spoofed wrong-ID and wrong-question replies ignored, our own random ID upstream,
-  TCP forwarding, timeout, retransmit, fallback, against a fake upstream on localhost.
-- **Pipeline**: block-before-cache, negative caching, EDNS cache variants, truncation for UDP,
-  the upstream in-flight cap failing fast, `SERVFAIL`, `FORMERR`.
+  TCP forwarding, timeout, retransmit, fallback, moving on after SERVFAIL / REFUSED, the demoted
+  primary being retried after 60 s (fake clock), against a fake upstream on localhost.
+- **Pipeline**: block-before-cache, negative caching with the SOA MINIMUM, EDNS cache variants,
+  truncation for UDP, the upstream in-flight cap failing fast, the dotted-label cache-poisoning
+  attempt, two-question queries refused, bypass canaries, CNAME cloaking (fresh and cached),
+  `SERVFAIL`, `FORMERR`.
 - **Rate limiting**: token buckets, LRU bound under a million spoofed addresses, the global cap
-  holding when every packet has a different source, loopback exemption.
+  holding when every packet has a different source, IPv6 clients counted per /64, loopback exemption.
 - **Servers**: the real UDP and TCP listeners: TC=1 over UDP then the full answer over TCP, the
   1,232-byte UDP cap, several queries on one TCP connection, the per-client connection cap, a
   drip-fed query cut off at its deadline, a client that never reads replies being disconnected,
@@ -247,7 +279,13 @@ When a token is configured, every endpoint except `/api/health` needs `Authoriza
   and restore.
 - **REST API**: tested over real HTTP, including validation, auth on reads and writes, cross-site
   requests, DNS rebinding Host headers, refusing a non-local bind without a token, CORS, rate
-  limits, HTTP server limits and stalled-header connections, static files and path-traversal attempts.
+  limits, HTTP server limits and stalled-header connections, anti-framing headers, short tokens
+  refused, static files and path-traversal attempts.
+
+`cd frontend && npm run lint && npm test` runs ESLint and 10 Vitest tests (formatting helpers, and
+the API client's token header and its 401 → "ask for the token" signal).
+
+CI (`.github/workflows/ci.yml`) runs all of it on every push, plus a Docker image build.
 
 ## Project layout
 
