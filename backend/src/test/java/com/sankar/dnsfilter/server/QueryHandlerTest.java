@@ -42,7 +42,7 @@ class QueryHandlerTest {
     }
 
     @AfterEach
-    void tearDown() { upstream.close(); }
+    void tearDown() { if (upstream != null) upstream.close(); }
 
     private DnsMessage ask(int id, String name, int type) {
         byte[] q = DnsWriter.buildQuery(id, name, type);

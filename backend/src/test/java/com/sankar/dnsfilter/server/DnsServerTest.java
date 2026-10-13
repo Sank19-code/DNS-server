@@ -52,24 +52,34 @@ class DnsServerTest {
         QueryHandler handler = new QueryHandler(blocklist, new DnsCache(100),
                 new UpstreamResolver(List.of(upstream.address()), 1000), stats, s);
 
-        udp = new DnsServer(config("dns.port=0\ndns.bind=127.0.0.1\n"), handler, stats);
-        port = udp.bind();
+        // UDP and TCP share one port. Take a random TCP port first (the OS never picks a reserved
+        // one; a random UDP port can land in a block Windows reserves for TCP), then bind UDP on it.
+        for (int attempt = 0; ; attempt++) {
+            // short TCP limits so the Slowloris tests run in well under a second each
+            tcp = new TcpDnsServer(config("dns.port=0\ndns.bind=127.0.0.1\n"
+                    + "dns.tcp.maxConnectionsPerClient=3\ndns.tcp.idleTimeoutMs=1500\n"
+                    + "dns.tcp.messageTimeoutMs=300\ndns.tcp.writeTimeoutMs=300\n"),
+                    handler, Admission.from(config(""), stats));
+            port = tcp.start();
+            udp = new DnsServer(config("dns.port=" + port + "\ndns.bind=127.0.0.1\n"), handler, stats);
+            try {
+                udp.bind();
+                break;
+            } catch (java.net.SocketException taken) {
+                tcp.stop();
+                if (attempt >= 20) throw taken;
+            }
+        }
         udpThread = new Thread(udp::serve, "test-dns-udp");
         udpThread.start();
-        // short TCP limits so the Slowloris tests run in well under a second each
-        tcp = new TcpDnsServer(config("dns.port=" + port + "\ndns.bind=127.0.0.1\n"
-                + "dns.tcp.maxConnectionsPerClient=3\ndns.tcp.idleTimeoutMs=1500\n"
-                + "dns.tcp.messageTimeoutMs=300\ndns.tcp.writeTimeoutMs=300\n"),
-                handler, Admission.from(config(""), stats));
-        tcp.start();
     }
 
     @AfterEach
     void tearDown() throws Exception {
-        udp.stop();
-        tcp.stop();
-        udpThread.join(3000);
-        upstream.close();
+        if (udp != null) udp.stop();
+        if (tcp != null) tcp.stop();
+        if (udpThread != null) udpThread.join(3000);
+        if (upstream != null) upstream.close();
     }
 
     private static Config config(String props) throws Exception {

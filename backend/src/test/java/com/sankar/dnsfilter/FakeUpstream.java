@@ -39,8 +39,23 @@ public class FakeUpstream implements AutoCloseable {
     public volatile int padding = 0;
 
     public FakeUpstream() throws Exception {
-        socket = new DatagramSocket(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
-        tcp = new ServerSocket(socket.getLocalPort(), 50, InetAddress.getLoopbackAddress());
+        // UDP and TCP must share one port number. Pick the TCP port first: the OS never hands out a
+        // reserved TCP port (Windows reserves big blocks for Hyper-V/WSL, and a random UDP port can
+        // land inside one), and a lingering TIME_WAIT connection (Linux) can't collide with it.
+        // Then bind UDP on the same number, retrying with a fresh port in the rare case it's taken.
+        DatagramSocket udp = null;
+        ServerSocket server = null;
+        for (int attempt = 0; udp == null; attempt++) {
+            server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            try {
+                udp = new DatagramSocket(new InetSocketAddress(InetAddress.getLoopbackAddress(), server.getLocalPort()));
+            } catch (java.net.SocketException taken) {
+                server.close();
+                if (attempt >= 20) throw taken;
+            }
+        }
+        socket = udp;
+        tcp = server;
         Thread udpThread = new Thread(this::loop, "fake-upstream-udp");
         udpThread.setDaemon(true);
         udpThread.start();

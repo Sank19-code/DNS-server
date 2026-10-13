@@ -63,7 +63,7 @@ class ApiServerTest {
     @AfterEach
     void tearDown() {
         if (api != null) api.stop();
-        upstream.close();
+        if (upstream != null) upstream.close();
     }
 
     private String startApi(String extraConfig) throws Exception {
