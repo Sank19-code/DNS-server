@@ -2,8 +2,9 @@
 
 The server is one process: DNS on port 5300 (UDP and TCP), and the API plus dashboard on 8081.
 PaaS hosts like Render, Railway or Vercel don't accept inbound UDP, so it needs a small Linux VM.
-This guide uses an **Oracle Cloud Always Free VM**, **Docker**, **Caddy** for HTTPS and a free
-**DuckDNS** hostname. (DigitalOcean or Azure credits from the GitHub Student Pack work the same.)
+This guide uses **Azure for Students** (no credit card, $100 credit, free small Linux VM for
+12 months), **Docker**, **Caddy** for HTTPS and a free **DuckDNS** hostname. Any other Linux VM
+(Oracle, AWS, DigitalOcean) works the same; only steps 1 and 2 differ.
 
 What you end up with:
 
@@ -13,60 +14,73 @@ What you end up with:
 | VM port 5300 (UDP + TCP) | **only your own IP** | the DNS server itself |
 | VM port 8081 | nobody from outside | the API, published on the VM's loopback for Caddy only |
 
+## 0. Activate Azure for Students
+
+Sign up at https://azure.microsoft.com/free/students with your **college email address**. No card
+is needed. You get $100 of credit for 12 months, renewable each year while you're a student.
+If the credit ever runs out, Azure disables the subscription; with no card on file it can't bill you.
+
+**Find your allowed regions first.** Student subscriptions may only deploy to a few regions,
+and the list differs per account. Deploying anywhere else fails with `RequestDisallowedByAzure`.
+Portal → search **Policy** → *Assignments* → open *Allowed resource deployment regions* (or a
+similarly named assignment) → its *Allowed locations* parameter. Pick one of those below.
+
 ## 1. Create the VM
 
-Oracle Cloud → Compute → Instances → **Create instance**:
+Portal → **Virtual machines** → *Create* → *Azure virtual machine*:
 
-- **Image:** Canonical Ubuntu **24.04** (Caddy and Docker Compose v2 are in its package repos).
-- **Shape:** `VM.Standard.A1.Flex` (Ampere ARM), 1 OCPU / 6 GB, Always Free. The Docker image
-  builds on ARM as well as x86.
-  If Oracle says *out of capacity*, try another availability domain, or use
-  `VM.Standard.E2.1.Micro` (1 GB RAM) and add swap in step 3.
-- **Networking:** the default VCN with a public subnet, and *Assign a public IPv4 address* on.
-- **SSH keys:** *Generate a key pair for me* → **Save private key**. You need it to log in.
+| Field | Value |
+|---|---|
+| Subscription | **Azure for Students** |
+| Resource group | new: `dns-filter` |
+| Virtual machine name | `dns-filter` (the downloaded key is named after it: `dns-filter_key.pem`) |
+| Region | one of your allowed regions (nearest to you) |
+| Image | **Ubuntu Server 24.04 LTS - x64 Gen2** (Caddy and Docker Compose v2 are in its package repos) |
+| Size | **B2ats v2** (2 vCPU, 1 GiB) or **B1s** (1 vCPU, 1 GiB). Both are in the free 750 hours/month |
+| Authentication | SSH public key, username `azureuser`, *Generate new key pair* |
+| Public inbound ports | *Allow selected ports* → **SSH (22)** (we add the rest in step 2) |
+| Disks → OS disk type | Standard SSD is enough |
 
-Note the instance's **public IP**. Log in from Git Bash on your PC:
-```bash
-chmod 600 ~/Downloads/ssh-key-*.key
-ssh -i ~/Downloads/ssh-key-*.key ubuntu@<vm-ip>
+*Review + create* → *Create* → **Download private key and create resource**. Keep the `.pem` file;
+it's the only way to log in. When it's done, open the VM and note its **Public IP address**.
+
+Log in from **PowerShell** on your PC. Windows' `ssh` refuses a key that other users can read, so
+lock it down first:
+```powershell
+icacls "$HOME\Downloads\dns-filter_key.pem" /inheritance:r /grant:r "$($env:USERNAME):(R)"
+ssh -i "$HOME\Downloads\dns-filter_key.pem" azureuser@<vm-ip>
 ```
 
 ## 2. Firewall: open only what's needed
 
-Instance → subnet → **Security List** (Oracle's cloud firewall, outside the VM) → *Add Ingress Rules*:
+VM → **Networking** → *Network settings* → *Create port rule* → *Inbound port rule*. The Network
+Security Group is Azure's cloud firewall, outside the VM:
 
-| Source CIDR | Protocol | Port | Why |
-|---|---|---|---|
-| `0.0.0.0/0` | TCP | 80, 443 | dashboard over HTTPS (Caddy). 80 is needed for the certificate |
-| **your IP**`/32` | UDP | 5300 | DNS, for you only |
-| **your IP**`/32` | TCP | 5300 | DNS over TCP (big answers), for you only |
+| Source | Source IP | Destination port | Protocol | Action | Name |
+|---|---|---|---|---|---|
+| Any | | 80,443 | TCP | Allow | `web` |
+| IP Addresses | **your IP** | 5300 | Any (UDP + TCP) | Allow | `dns-me-only` |
 
-SSH (22) is already open by default. Find **your IP** at https://ifconfig.me. Home and campus IPs
-change now and then; when DNS from your laptop stops working, update these two rules.
+Also edit the existing **SSH** rule: *Source* → *IP Addresses* → your IP. Then only you can even
+try to log in. Find **your IP** at https://ifconfig.me. Home and campus IPs change now and then;
+when SSH or DNS from your laptop stops working, update these rules.
 
-> **Never open 5300 to `0.0.0.0/0`.** An open DNS port is found within hours and used to amplify
-> DDoS attacks against other people. The rate limiters help, but this firewall rule is the real
+> **Never open 5300 to "Any".** An open DNS port is found within hours and used to amplify DDoS
+> attacks against other people. The rate limiters help, but this firewall rule is the real
 > protection.
 
-**Why the cloud firewall and not the VM's own iptables for 5300:** Docker publishes container
-ports with its own NAT rules, which skip the VM's `INPUT` chain. A rule like
-`iptables -I INPUT -p udp --dport 5300 -s <ip> -j ACCEPT` would do nothing for the container.
-The Security List sits outside the VM, so it always applies. (To filter on the VM too, rules go
-in Docker's `DOCKER-USER` chain.)
-
-Caddy runs directly on the VM, so ports 80/443 *do* go through `INPUT`. Oracle's Ubuntu image
-blocks them there by default, so open them:
-```bash
-sudo iptables -I INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
-sudo netfilter-persistent save
-```
+Azure's Ubuntu image doesn't block ports on the VM itself, so no `iptables` changes are needed.
+(Had they been: Docker publishes container ports through its own NAT rules, which skip the VM's
+`INPUT` chain, so VM-level rules for port 5300 belong in Docker's `DOCKER-USER` chain. The
+Network Security Group sits outside the VM and always applies.)
 
 ## 3. Install Docker and start the server
 
+On the VM:
 ```bash
 sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2 git
 
-# Only on the 1 GB E2.1.Micro shape: 2 GB swap, or the Maven/npm build runs out of memory
+# 1 GiB of RAM isn't enough for the Maven + npm build: add 2 GB of swap first
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
@@ -77,7 +91,7 @@ echo "DNSFILTER_API_TOKEN=$(openssl rand -hex 24)" > .env
 echo "DNSFILTER_API_PUBLICREADS=true" >> .env       # public demo: see below
 cat .env    # copy the token to a password manager: you need it to change anything
 
-sudo docker compose up -d --build                  # first build takes a few minutes
+sudo docker compose up -d --build                  # first build: ~5-10 minutes on a small VM
 curl -s localhost:8081/api/health                  # {"status":"ok"}
 sudo docker compose logs --tail 20                 # blocklist downloaded, servers listening
 ```
@@ -90,12 +104,14 @@ everything except `/api/health` needs the token).
 
 `docker-compose.yml` publishes 8081 on the VM's loopback only (`127.0.0.1:8081:8081`), so the API
 is reachable from outside only through Caddy. Dashboard edits to the lists and the saved stats live
-in the `data` volume and survive rebuilds.
+in the `data` volume and survive rebuilds. `restart: unless-stopped` brings the server back after
+a VM reboot.
 
 ## 4. Hostname and HTTPS
 
 1. Sign in at https://www.duckdns.org, create a subdomain (e.g. `yourname`), set its IP to the
-   VM's public IP and click *update ip*. Oracle keeps that IP for as long as the instance exists.
+   VM's public IP and click *update ip*. Azure keeps a Standard public IP as long as the VM's IP
+   resource exists, even while the VM is stopped.
 2. On the VM:
    ```bash
    sudo apt-get install -y caddy
@@ -111,7 +127,7 @@ clients. Dashboard and API share one origin, so no CORS setting is needed.
 
 From your PC (Git Bash or PowerShell):
 ```bash
-curl -s https://yourname.duckdns.org/api/health                  # {"status":"ok"}
+curl -s https://yourname.duckdns.org/api/health                                             # {"status":"ok"}
 curl -s -o /dev/null -w "%{http_code}\n" -X DELETE https://yourname.duckdns.org/api/cache   # 401: token needed
 powershell -ExecutionPolicy Bypass -File scripts/raw-query.ps1 -Name ad.doubleclick.net -Server <vm-ip>   # rcode=3
 powershell -ExecutionPolicy Bypass -File scripts/raw-query.ps1 -Name github.com -Server <vm-ip>           # an address
@@ -124,9 +140,16 @@ Then open `https://yourname.duckdns.org` and try "Test a domain".
 cd DNS-server && git pull && sudo docker compose up -d --build
 ```
 
+## Keeping an eye on the credit
+
+Portal → **Subscriptions** → *Azure for Students* → *Overview* shows the remaining credit, and
+*Cost Management* → *Cost analysis* shows what's using it. The VM size above is covered by the free
+hours; small items such as the public IP or disk may draw a little from the credit. Stopping the VM
+(*Stop*, which deallocates it) stops compute charges, but the demo is offline while it's stopped.
+
 ## Checklist
 
-- [ ] Security List: 5300 UDP + TCP open to your IP `/32` only; 80 and 443 open to all
+- [ ] Network Security Group: 80/443 open to all; 5300 and SSH (22) only from your IP
 - [ ] `DNSFILTER_API_TOKEN` set: `DELETE /api/cache` without it returns 401
 - [ ] `https://yourname.duckdns.org` loads with a valid certificate
 - [ ] `curl http://<vm-ip>:8081/api/health` from your PC fails (8081 isn't reachable from outside)
@@ -139,3 +162,6 @@ cd DNS-server && git pull && sudo docker compose up -d --build
   "Test a domain" rate limit (5 lookups/s) is shared by all visitors, and web lookups show up
   under one client in "top clients". DNS clients on port 5300 are still told apart by their IP.
 - The query log is in memory plus `data/stats.json`; nothing is kept beyond the last 500 queries.
+- 1 GiB of RAM runs the server comfortably: measured with the full 72k-domain blocklist after
+  10,000 queries, about 10 MB of live heap and about 100 MB for the whole Java process. The image
+  build is what needs the swap file from step 3; the swap also gives headroom for Docker and Caddy.
