@@ -32,8 +32,14 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Starts the real HTTP server on a random port and talks to it over HTTP. */
 class ApiServerTest {
 
-    private final HttpClient http = HttpClient.newBuilder().proxy(HttpClient.Builder.NO_PROXY).build();
+    private final HttpClient http = HttpClient.newBuilder().proxy(HttpClient.Builder.NO_PROXY)
+            .connectTimeout(java.time.Duration.ofSeconds(5)).build();
     private FakeUpstream upstream;
+
+    /** Every test request gets a timeout: a server that never answers fails the test, not the build. */
+    private static HttpRequest.Builder req(String url) {
+        return HttpRequest.newBuilder(URI.create(url)).timeout(java.time.Duration.ofSeconds(20));
+    }
     private Blocklist blocklist;
     private DnsCache cache;
     private StatsCollector stats;
@@ -69,7 +75,7 @@ class ApiServerTest {
     }
 
     private HttpResponse<String> send(String method, String path, String body, String token) throws Exception {
-        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(base + path))
+        HttpRequest.Builder b = req(base + path)
                 .method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body))
                 .header("Content-Type", "application/json");
         if (token != null) b.header("Authorization", "Bearer " + token);
@@ -261,7 +267,7 @@ class ApiServerTest {
     @Test
     void postBodyMustBeJson() throws Exception {
         // text/plain is a "simple" request: browsers send it cross-site without asking first
-        HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create(base + "/blocklist"))
+        HttpResponse<String> r = http.send(req(base + "/blocklist")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"domain\":\"evil.com\"}"))
                 .header("Content-Type", "text/plain").build(), HttpResponse.BodyHandlers.ofString());
         assertEquals(415, r.statusCode());
@@ -311,16 +317,17 @@ class ApiServerTest {
     }
 
     private HttpResponse<String> sendWithOrigin(String method, String path, String body, String origin) throws Exception {
-        HttpRequest req = HttpRequest.newBuilder(URI.create(base + path))
+        HttpRequest request = req(base + path)
                 .method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body))
                 .header("Content-Type", "application/json")
                 .header("Origin", origin).build();
-        return http.send(req, HttpResponse.BodyHandlers.ofString());
+        return http.send(request, HttpResponse.BodyHandlers.ofString());
     }
 
     /** GET /api/queries with a hand-written Host header (HttpClient won't let us set one). */
     private static String rawHttp(int port, String host) throws Exception {
         try (Socket s = new Socket("127.0.0.1", port)) {
+            s.setSoTimeout(10_000);
             s.getOutputStream().write(("GET /api/queries HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")
                     .getBytes(StandardCharsets.US_ASCII));
             return new String(s.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -355,13 +362,13 @@ class ApiServerTest {
         assertEquals(403, evil.statusCode());
         assertFalse(evil.body().contains("do not serve"));
 
-        HttpResponse<String> post = http.send(HttpRequest.newBuilder(URI.create(root + "/"))
+        HttpResponse<String> post = http.send(req(root + "/")
                 .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
         assertEquals(405, post.statusCode());
     }
 
     private HttpResponse<String> raw(String url) throws Exception {
-        return http.send(HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofString());
+        return http.send(req(url).build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> get200(String url) throws Exception {
@@ -417,26 +424,29 @@ class ApiServerTest {
 
     @Test
     void httpServerLimitsAreAppliedUnlessAlreadySet() throws Exception {
-        // start() ran in setUp: the JDK server limits must be set (it has none by default)
-        assertNotNull(System.getProperty("jdk.httpserver.maxConnections"));
-        assertNotNull(System.getProperty("sun.net.httpserver.maxReqTime"));
-        String before = System.getProperty("sun.net.httpserver.maxRspTime");
-        System.setProperty("sun.net.httpserver.maxRspTime", "77");
+        String before = System.getProperty("sun.net.httpserver.idleInterval");
         try {
             Path cfg = Files.createTempFile("api", ".properties");
-            Files.writeString(cfg, "api.maxResponseSec=5\n");
+            Files.writeString(cfg, "api.idleSec=7\n");
+            System.clearProperty("sun.net.httpserver.idleInterval");
             ApiServer.applyHttpServerLimits(Config.load(cfg.toString()));
-            assertEquals("77", System.getProperty("sun.net.httpserver.maxRspTime"), "a -D value wins");
+            assertEquals("7", System.getProperty("sun.net.httpserver.idleInterval"), "set from config when absent");
+
+            System.setProperty("sun.net.httpserver.idleInterval", "77");
+            ApiServer.applyHttpServerLimits(Config.load(cfg.toString()));
+            assertEquals("77", System.getProperty("sun.net.httpserver.idleInterval"), "a -D value wins");
         } finally {
-            if (before == null) System.clearProperty("sun.net.httpserver.maxRspTime");
-            else System.setProperty("sun.net.httpserver.maxRspTime", before);
+            if (before == null) System.clearProperty("sun.net.httpserver.idleInterval");
+            else System.setProperty("sun.net.httpserver.idleInterval", before);
         }
     }
 
     @Test
-    void stalledRequestHeadersAreDroppedAndTheServerStaysUsable() throws Exception {
-        // Slowloris: open many connections and never finish the headers. The other requests must
-        // still be answered (the dispatcher doesn't block on them, and connections are capped).
+    void stalledRequestHeadersAreDroppedAndTheServerRecovers() throws Exception {
+        // Slowloris: many connections that never finish their headers. The JDK server spends a
+        // worker thread on each until sun.net.httpserver.maxReqTime (2 s in tests, set in pom.xml;
+        // 10 s by default in production) closes it - then normal requests are served again.
+        // So the API stalls for at most that long; on the internet, Caddy in front absorbs this.
         int port = Integer.parseInt(base.replaceAll(".*:(\\d+)/api", "$1"));
         Socket[] slow = new Socket[20];
         try {
@@ -444,7 +454,10 @@ class ApiServerTest {
                 slow[i] = new Socket("127.0.0.1", port);
                 slow[i].getOutputStream().write("GET /api/stats HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Slow: ".getBytes(StandardCharsets.US_ASCII));
             }
+            long start = System.nanoTime();
             assertEquals(200, send("GET", "/health", null, null).statusCode());
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(ms < 10_000, "answered once the header limit dropped the slow clients: " + ms + " ms");
         } finally {
             for (Socket s : slow) if (s != null) s.close();
         }

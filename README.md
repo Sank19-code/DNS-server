@@ -228,7 +228,7 @@ stay up, stay fast for normal clients, and not serve as an amplifier:
 | More packets than workers | Bounded queue; overflow is dropped and counted |
 | Flood of never-seen names (random subdomains) | At most 12 upstream lookups in flight; the rest get SERVFAIL at once, so cached and blocked names keep answering in microseconds |
 | Slow TCP clients (Slowloris) | ≤64 connections, ≤8 per IP; 10 s idle limit; a started query must fully arrive within 2 s; a client that stops reading replies is cut off after 5 s |
-| Slow HTTP clients | ≤100 connections; request headers within 10 s; bodies are only read after the token check |
+| Slow HTTP clients | ≤100 connections; request headers within 10 s; bodies are only read after the token check. The JDK server spends a thread on each client still sending headers, so many slow clients can stall the API for up to those 10 s. That's why the internet-facing setup puts Caddy in front (it reads whole requests first) |
 
 ## REST API
 

@@ -33,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 public class Main {
     public static void main(String[] args) throws Exception {
         Config config = Config.load(args.length > 0 ? args[0] : null);
+        ApiServer.applyHttpServerLimits(config);   // before any HttpServer exists in this JVM
 
         Blocklist blocklist = new Blocklist();
         blocklist.loadFromConfig(config);

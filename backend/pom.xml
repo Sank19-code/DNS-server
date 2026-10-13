@@ -36,6 +36,18 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
+                <configuration>
+                    <!-- The JDK HttpServer reads these once per JVM, when the FIRST server is created.
+                         Tests that start a plain HttpServer (BlocklistTest) can run before ApiServerTest,
+                         so set them for the whole test JVM up front; otherwise the result depends on
+                         test order (it hung on Linux CI). maxReqTime is short to keep tests fast. -->
+                    <systemPropertyVariables>
+                        <jdk.httpserver.maxConnections>100</jdk.httpserver.maxConnections>
+                        <sun.net.httpserver.maxReqTime>2</sun.net.httpserver.maxReqTime>
+                        <sun.net.httpserver.maxRspTime>30</sun.net.httpserver.maxRspTime>
+                        <sun.net.httpserver.idleInterval>30</sun.net.httpserver.idleInterval>
+                    </systemPropertyVariables>
+                </configuration>
             </plugin>
             <!-- Builds a single runnable jar: java -jar target/dns-filter.jar -->
             <plugin>

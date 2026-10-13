@@ -209,8 +209,13 @@ public class ApiServer {
      *   sun.net.httpserver.idleInterval api.idleSec          [30]   keep-alive connections closed after
      * The header timer stops before our handler runs, so a slow /api/blocklist/reload isn't cut off.
      * Request bodies are only read after the token check, so an anonymous client can't drip-feed one.
+     * Main calls this before anything else: ANY HttpServer created earlier in the JVM would freeze
+     * the JDK's settings without these limits.
+     * Limit: the JDK server spends a worker thread on each client still sending headers, so many
+     * slow clients can stall the API until maxReqTime drops them. Internet-facing, put Caddy (or
+     * another reverse proxy) in front - it reads whole requests before passing them on.
      */
-    static void applyHttpServerLimits(Config config) {
+    public static void applyHttpServerLimits(Config config) {
         setIfAbsent("jdk.httpserver.maxConnections", config.getInt("api.maxConnections", 100));
         setIfAbsent("sun.net.httpserver.maxReqTime", config.getInt("api.maxHeaderSec", 10));
         setIfAbsent("sun.net.httpserver.maxRspTime", config.getInt("api.maxResponseSec", 30));
